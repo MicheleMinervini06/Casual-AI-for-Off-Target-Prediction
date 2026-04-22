@@ -5,17 +5,28 @@ from typing import Iterable
 import h5py
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from dag.nodes import CRISPRPairFeatures
+from dag.mismatch import TYPE_TO_INDEX
 
 STANDARD_COLUMNS = ["sgRNA_seq", "off_seq", "label", "guide_name", "reads", "assay"]
 
 COLUMN_CANDIDATES: dict[str, list[str]] = {
-    "sgRNA_seq": ["sgrna_seq", "sgrna", "guide_seq", "guide", "grna", "on_seq"],
-    "off_seq": ["off_seq", "offtarget_seq", "offtarget", "target_seq", "target"],
+    # Mappa "target" come sequenza della guida
+    "sgRNA_seq": ["sgrna_seq", "sgrna", "guide_seq", "guide", "grna", "on_seq", "target"],
+    
+    # Mappa "offtarget_sequence"
+    "off_seq": ["off_seq", "offtarget_seq", "offtarget_sequence", "offtarget", "target_seq"],
+    
     "label": ["label", "y", "class", "is_offtarget", "active"],
-    "guide_name": ["guide_name", "guide_id", "sgrna_id", "guide"],
-    "reads": ["reads", "read_count", "counts", "n_reads", "count"],
+    
+    # Mappa "name" come ID della guida
+    "guide_name": ["guide_name", "guide_id", "sgrna_id", "guide", "name"],
+    
+    # Aggiunti sia "changeseq_reads" che "guideseq_reads"
+    "reads": ["reads", "read_count", "counts", "n_reads", "count", "changeseq_reads", "guideseq_reads"],
+    
     "assay": ["assay", "dataset", "source", "assay_type"],
 }
 
@@ -96,15 +107,15 @@ def build_features(df: pd.DataFrame, vectors_out: str | Path | None = None) -> p
     energy_vectors: list[np.ndarray] = []
     profiles: list[np.ndarray] = []
 
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building features"):
         pair = CRISPRPairFeatures(
             sgRNA_seq=str(row["sgRNA_seq"]),
             off_seq=str(row["off_seq"]),
-            assay=str(row.get("assay", "unknown")),
-            guide_name=str(row.get("guide_name", "unknown")),
         )
 
         features = pair.to_feature_dict()
+        features["assay"] = str(row.get("assay", "unknown"))
+        features["guide_name"] = str(row.get("guide_name", row.get("sgRNA_seq", "unknown")))
         features["label"] = int(row.get("label", 0))
         reads_value = row.get("reads", np.nan)
         features["reads"] = float(reads_value) if pd.notna(reads_value) else np.nan
@@ -123,11 +134,13 @@ def build_features(df: pd.DataFrame, vectors_out: str | Path | None = None) -> p
     if vectors_out is not None:
         vector_path = Path(vectors_out)
         vector_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded_type_vectors = np.asarray(type_vectors, dtype=np.int8)
         with h5py.File(vector_path, mode="w") as h5:
             h5.create_dataset("mm_vector", data=np.asarray(mm_vectors, dtype=np.int8))
-            h5.create_dataset("type_vector", data=np.asarray(type_vectors, dtype=np.int8))
+            h5.create_dataset("type_vector", data=encoded_type_vectors)
             h5.create_dataset("energy_vector", data=np.asarray(energy_vectors, dtype=float))
             h5.create_dataset("position_profile", data=np.asarray(profiles, dtype=float))
+            h5.attrs["type_encoding"] = str(TYPE_TO_INDEX)
     return feature_df
 
 

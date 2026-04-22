@@ -16,8 +16,6 @@ class CRISPRPairFeatures:
 
     sgRNA_seq: str
     off_seq: str
-    assay: str
-    guide_name: str
 
     sgRNA_spacer: str = field(init=False)
     off_spacer: str = field(init=False)
@@ -35,8 +33,6 @@ class CRISPRPairFeatures:
         guide_seq: str | None = None,
         target_seq: str | None = None,
         pam: str | None = None,
-        assay: str = "unknown",
-        guide_name: str = "unknown",
         enzyme: str | None = None,
     ) -> None:
         # Legacy constructor support: guide_seq/target_seq/pam.
@@ -55,8 +51,6 @@ class CRISPRPairFeatures:
 
         self.sgRNA_seq = sgRNA_seq.upper().replace("U", "T")
         self.off_seq = off_seq.upper().replace("U", "T")
-        self.assay = assay
-        self.guide_name = guide_name
         self._initialize_vectors()
 
     def _initialize_vectors(self) -> None:
@@ -108,8 +102,6 @@ class CRISPRPairFeatures:
             "sgRNA_spacer": self.sgRNA_spacer,
             "off_spacer": self.off_spacer,
             "pam": self.pam,
-            "assay": self.assay,
-            "guide_name": self.guide_name,
             "pam_score": self.node_A_pam,
             "node_A_pam": self.node_A_pam,
             "node_B_proximal": self.node_B_proximal,

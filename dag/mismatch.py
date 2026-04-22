@@ -100,6 +100,7 @@ def mismatch_energy_penalty(kind: str, position: int = 0) -> float:
 
 __all__ = [
     "MISMATCH_ENERGY_PENALTY",
+    "TYPE_TO_INDEX",
     "build_mismatch_vectors",
     "classify_mismatch",
     "energy_penalty",
