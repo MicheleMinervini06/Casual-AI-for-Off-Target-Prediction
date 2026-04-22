@@ -3,24 +3,36 @@ _base: experiments/configs/base.yaml
 experiment:
   name:        exp_01_baseline
   description: >
-    Baseline XGBoost con feature biologiche derivate dal DAG.
+    Baseline XGBoost e CatBoost con feature biologiche derivate dal DAG.
     Valutazione within-dataset (CHANGE-seq) e cross-assay (GUIDE-seq).
-    Calcola SHAP values per BAS baseline.
+    Calcola SHAP values e feature importance per entrambi i modelli.
 
-model:
-  type: xgboost
-  params:
-    max_depth:             6
-    learning_rate:         0.05
-    n_estimators:          500
-    subsample:             0.8
-    colsample_bytree:      0.8
-    min_child_weight:      5
-    gamma:                 0.1
-    reg_alpha:             0.1
-    reg_lambda:            1.0
-    random_state:          42
-  early_stopping_rounds:   30
+models:
+  - type: xgboost
+    params:
+      max_depth:             12
+      learning_rate:         0.2
+      n_estimators:          1000
+      subsample:             1.0
+      colsample_bytree:      0.8
+      min_child_weight:      5
+      gamma:                 0.1
+      reg_alpha:             0.1
+      reg_lambda:            1.0
+      random_state:          42
+    early_stopping_rounds:   30
+
+  - type: catboost
+    params:
+      depth:                 8
+      learning_rate:         0.08
+      iterations:            1000
+      l2_leaf_reg:           5
+      random_seed:           42
+      loss_function:         Logloss
+      eval_metric:           AUC
+      verbose:               false
+    early_stopping_rounds:   30
 
 ablation:
   run: true
@@ -28,18 +40,42 @@ ablation:
     - name: pam_only
       feature_cols:
         - pam_score
-        - pam_canonical
+        - concept_pam
+
     - name: seed_only
       feature_cols:
-        - mm_pam_proximal
-        - has_mm_pos1
-        - mm_seed_ext
-        - mm_seed_total
+        # I nodi energetici della regione Seed (posizioni 1-12)
+        - node_B_proximal
+        - node_C_seed_extension
+        - concept_proximal_load
+        - concept_seed_extension_load
+        # (Opzionale) I profili posizionali esatti della regione seed
+        - profile_pos_01
+        - profile_pos_02
+        - profile_pos_03
+        - profile_pos_04
+        - profile_pos_05
+        - profile_pos_06
+        - profile_pos_07
+        - profile_pos_08
+        - profile_pos_09
+        - profile_pos_10
+        - profile_pos_11
+        - profile_pos_12
+
     - name: no_energy
       exclude_cols:
-        - energy_pam_prox
-        - energy_seed_ext
-        - energy_nonseed
-        - energy_total
+        # Rimuoviamo tutte le metriche legate all'energia complessiva
+        - mean_energy_penalty
+        - total_energy_penalty
+        - concept_energy
+        # TODO - Valutare se rimuovere anche i nodi energetici specifici della regione seed
+        # - node_B_proximal
+        # - node_C_seed_extension
+        # - node_D_non_seed
+        # - concept_proximal_load
+        # - concept_seed_extension_load
+        # - concept_non_seed_load
+
     - name: full_dag
       feature_cols: null

@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Protocol
 
 import h5py
 import numpy as np
@@ -20,9 +21,39 @@ from evaluation.metrics import (
     find_optimal_threshold,
     results_to_dataframe,
 )
+from models.baseline.catboost import CatBoostWrapper
 from models.baseline.xgboost import XGBoostWrapper
 
 log = logging.getLogger(__name__)
+
+MODEL_REGISTRY = {
+    "xgboost": XGBoostWrapper,
+    "catboost": CatBoostWrapper,
+}
+
+
+class BaselineModel(Protocol):
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        feature_names: list[str] | None = None,
+    ) -> "BaselineModel":
+        ...
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        ...
+
+    def explain(self, X: np.ndarray) -> np.ndarray:
+        ...
+
+    def feature_importance(self) -> np.ndarray:
+        ...
+
+    def save(self, path: str | Path) -> None:
+        ...
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -106,10 +137,31 @@ def save_shap(
     log.info("SHAP salvati: %s  shape=%s", path, shap_vals.shape)
 
 
+def _model_label(model_type: str) -> str:
+    normalized = model_type.lower()
+    if normalized == "xgboost":
+        return "XGBoost"
+    if normalized == "catboost":
+        return "CatBoost"
+    return model_type
+
+
+def build_model(model_cfg: dict, feature_names: list[str]) -> tuple[str, type[Any]]:
+    model_type = model_cfg["type"].lower()
+    if model_type not in MODEL_REGISTRY:
+        raise ValueError(f"Unsupported model type: {model_cfg['type']}")
+
+    model_cls = MODEL_REGISTRY[model_type]
+    return _model_label(model_type), model_cls
+
+
 # ── Ablation ──────────────────────────────────────────────────────────────────
 
 def run_ablation(
+    model_name: str,
+    model_cls: type[Any],
     cfg:         dict,
+    model_cfg:   dict,
     train:       pd.DataFrame,
     val:         pd.DataFrame,
     test:        pd.DataFrame,
@@ -119,7 +171,6 @@ def run_ablation(
         return []
 
     all_cols  = cfg["features"]["feature_cols"]
-    model_cfg = cfg["model"]
     rows: list[dict] = []
 
     for variant in cfg["ablation"]["variants"]:
@@ -137,8 +188,8 @@ def run_ablation(
         X_v,  y_v,  _    = prepare_xy(val,   used)
         X_te, y_te, _    = prepare_xy(test,  used)
 
-        m = XGBoostWrapper(
-            params=model_cfg["params"],
+        m = model_cls(
+            params=model_cfg.get("params"),
             early_stopping_rounds=model_cfg.get("early_stopping_rounds", 30),
             feature_names=used,
         )
@@ -149,13 +200,101 @@ def run_ablation(
             metric=cfg["evaluation"]["threshold_metric"],
         )
         res = evaluate_model(
-            f"XGBoost-{name}", y_te, m.predict_proba(X_te),
+            f"{model_name}-{name}", y_te, m.predict_proba(X_te),
             split="within_test", threshold=thr,
             store_curves=False,
         )
         rows.append({**res.to_dict(), "variant": name})
 
     return rows
+
+
+def run_model_pipeline(
+    model_cfg: dict,
+    cfg: dict,
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+    guide_df: pd.DataFrame | None,
+    feature_cols: list[str],
+    results_dir: Path,
+) -> tuple[list[EvalResult], list[dict]]:
+    model_name, model_cls = build_model(model_cfg, feature_cols)
+    log.info("Training model: %s", model_name)
+
+    X_train, y_train, used_cols = prepare_xy(train, feature_cols)
+    X_val, y_val, _ = prepare_xy(val, used_cols)
+    X_test, y_test, _ = prepare_xy(test, used_cols)
+
+    model: BaselineModel = model_cls(
+        params=model_cfg.get("params"),
+        early_stopping_rounds=model_cfg.get("early_stopping_rounds", 30),
+        feature_names=used_cols,
+    )
+
+    model.fit(X_train, y_train, X_val, y_val, feature_names=used_cols)
+
+    if cfg["logging"]["save_model"]:
+        model.save(results_dir / f"{model_name.lower()}_model.pkl")
+
+    optimal_thr = find_optimal_threshold(
+        y_val,
+        model.predict_proba(X_val),
+        metric=cfg["evaluation"]["threshold_metric"],
+    )
+
+    result_within = evaluate_model(
+        model_name,
+        y_test,
+        model.predict_proba(X_test),
+        split="within_test",
+        threshold=optimal_thr,
+        store_curves=cfg["evaluation"]["store_curves"],
+    )
+
+    all_results: list[EvalResult] = [result_within]
+    X_guide: np.ndarray | None = None
+    y_guide: np.ndarray | None = None
+
+    if guide_df is not None:
+        X_guide, y_guide, _ = prepare_xy(guide_df, used_cols)
+        result_cross = evaluate_model(
+            model_name,
+            y_guide,
+            model.predict_proba(X_guide),
+            split="cross_assay",
+            threshold=optimal_thr,
+            store_curves=cfg["evaluation"]["store_curves"],
+        )
+        all_results.append(result_cross)
+
+    if cfg["logging"]["save_shap"]:
+        save_shap(
+            model.explain(X_test),
+            test,
+            used_cols,
+            results_dir / f"shap_values_{model_name.lower()}_test.h5",
+        )
+        if guide_df is not None:
+            assert X_guide is not None
+            save_shap(
+                model.explain(X_guide),
+                guide_df,
+                used_cols,
+                results_dir / f"shap_values_{model_name.lower()}_guide.h5",
+            )
+
+    fi = pd.DataFrame(
+        {
+            "feature": used_cols,
+            "importance": model.feature_importance(),
+        }
+    ).sort_values("importance", ascending=False)
+    fi.to_csv(results_dir / f"feature_importance_{model_name.lower()}.csv", index=False)
+    log.info("Top-5 feature (%s):\n%s", model_name, fi.head().to_string(index=False))
+
+    ablation_rows = run_ablation(model_name, model_cls, cfg, model_cfg, train, val, test, results_dir)
+    return all_results, ablation_rows
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -172,9 +311,7 @@ def main(config_path: Path) -> None:
     guide_df         = load_guideseq(cfg) if cfg["evaluation"]["cross_assay"] else None
     feature_cols     = cfg["features"]["feature_cols"]
 
-    X_train, y_train, used_cols = prepare_xy(train, feature_cols)
-    X_val,   y_val,   _         = prepare_xy(val,   used_cols)
-    X_test,  y_test,  _         = prepare_xy(test,  used_cols)
+    _, _, used_cols = prepare_xy(train, feature_cols)
     log.info("Feature usate (%d): %s", len(used_cols), used_cols)
 
     # 2. Validazione DAG
@@ -186,71 +323,31 @@ def main(config_path: Path) -> None:
     np.save(results_dir / "bio_prior_empirical.npy", bio_prior)
     log.info("Top-3 posizioni sensibili: %s", np.argsort(bio_prior)[::-1][:3] + 1)
 
-    # 3. Training
-    model_cfg = cfg["model"]
-    model = XGBoostWrapper(
-        params=model_cfg["params"],
-        early_stopping_rounds=model_cfg.get("early_stopping_rounds", 30),
-        feature_names=used_cols,
-    )
-    model.fit(X_train, y_train, X_val, y_val, feature_names=used_cols)
+    # 3. Training multi-modello
+    model_specs = cfg.get("models") or [cfg["model"]]
+    all_results: list[EvalResult] = []
+    all_ablation_rows: list[dict] = []
 
-    if cfg["logging"]["save_model"]:
-        model.save(results_dir / "xgboost_model.pkl")
-
-    # 4. Threshold ottimale su val set
-    optimal_thr = find_optimal_threshold(
-        y_val, model.predict_proba(X_val),
-        metric=cfg["evaluation"]["threshold_metric"],
-    )
-
-    # 5. Valutazione within-dataset
-    result_within = evaluate_model(
-        "XGBoost", y_test, model.predict_proba(X_test),
-        split="within_test",
-        threshold=optimal_thr,
-        store_curves=cfg["evaluation"]["store_curves"],
-    )
-    all_results: list[EvalResult] = [result_within]
-
-    # 6. Valutazione cross-assay
-    if guide_df is not None:
-        X_guide, y_guide, _ = prepare_xy(guide_df, used_cols)
-        result_cross = evaluate_model(
-            "XGBoost", y_guide, model.predict_proba(X_guide),
-            split="cross_assay",
-            threshold=optimal_thr,
-            store_curves=cfg["evaluation"]["store_curves"],
+    for model_cfg in model_specs:
+        model_results, ablation_rows = run_model_pipeline(
+            model_cfg,
+            cfg,
+            train,
+            val,
+            test,
+            guide_df,
+            used_cols,
+            results_dir,
         )
-        all_results.append(result_cross)
+        all_results.extend(model_results)
+        all_ablation_rows.extend(ablation_rows)
 
-    # 7. SHAP
-    if cfg["logging"]["save_shap"]:
-        log.info("SHAP su test set...")
-        save_shap(model.explain(X_test), test, used_cols,
-                  results_dir / "shap_values_test.h5")
-
-        if guide_df is not None:
-            log.info("SHAP su GUIDE-seq...")
-            save_shap(model.explain(X_guide), guide_df, used_cols,
-                      results_dir / "shap_values_guide.h5")
-
-    # 8. Feature importance
-    fi = pd.DataFrame({
-        "feature":    used_cols,
-        "importance": model.model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-    fi.to_csv(results_dir / "feature_importance.csv", index=False)
-    log.info("Top-5 feature:\n%s", fi.head().to_string(index=False))
-
-    # 9. Ablation
-    ablation_rows = run_ablation(cfg, train, val, test, results_dir)
-    if ablation_rows:
-        pd.DataFrame(ablation_rows).to_csv(
+    if all_ablation_rows:
+        pd.DataFrame(all_ablation_rows).to_csv(
             results_dir / "ablation_results.csv", index=False
         )
 
-    # 10. Risultati finali
+    # 4. Risultati finali
     metrics_df = results_to_dataframe(all_results)
     metrics_df.to_csv(results_dir / "metrics.csv", index=False)
     log.info("\nRisultati finali:\n%s", metrics_df.to_string(index=False))

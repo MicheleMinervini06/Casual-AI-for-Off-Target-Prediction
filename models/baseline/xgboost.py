@@ -97,6 +97,9 @@ class XGBoostWrapper:
             vals = vals[1]  # classe positiva
         return np.asarray(vals, dtype=float)
 
+    def feature_importance(self) -> np.ndarray:
+        return np.asarray(self.model.feature_importances_, dtype=float)
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)

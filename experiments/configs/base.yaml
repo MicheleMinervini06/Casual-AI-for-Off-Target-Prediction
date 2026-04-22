@@ -17,26 +17,43 @@ split:
 features:
   feature_cols:
     - pam_score
-    - pam_canonical
-    - mm_pam_proximal
-    - has_mm_pos1
-    - has_mm_pos1_2
-    - energy_pam_prox
-    - mm_seed_ext
-    - energy_seed_ext
-    - gc_seed
-    - mm_nonseed
-    - energy_nonseed
-    - gc_nonseed
-    - mm_seed_total
-    - mm_total
-    - energy_total
-    - gc_full
-    - n_wobble
-    - n_transition
-    - n_transversion
-    - first_mm_from_pam
-    - pam_x_seed_energy
+    - node_B_proximal
+    - node_C_seed_extension
+    - node_D_non_seed
+    - mismatch_count
+    - mismatch_rate
+    - gc_sgRNA
+    - gc_offtarget
+    - mean_energy_penalty
+    - total_energy_penalty
+    - profile_pos_01
+    - profile_pos_02
+    - profile_pos_03
+    - profile_pos_04
+    - profile_pos_05
+    - profile_pos_06
+    - profile_pos_07
+    - profile_pos_08
+    - profile_pos_09
+    - profile_pos_10
+    - profile_pos_11
+    - profile_pos_12
+    - profile_pos_13
+    - profile_pos_14
+    - profile_pos_15
+    - profile_pos_16
+    - profile_pos_17
+    - profile_pos_18
+    - profile_pos_19
+    - profile_pos_20
+    - concept_pam
+    - concept_proximal_load
+    - concept_seed_extension_load
+    - concept_non_seed_load
+    - concept_mismatch_rate
+    - concept_energy
+    - concept_gc_delta
+
 
 evaluation:
   primary_metric:   auprc
