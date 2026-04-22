@@ -79,8 +79,8 @@ def prepare_xy(
     missing   = [c for c in feature_cols if c not in df.columns]
     if missing:
         log.warning("Feature mancanti (ignorate): %s", missing)
-    X = df[available].values.astype(np.float32)
-    y = df["label"].values.astype(np.float32)
+    X = df[available].to_numpy(dtype=np.float32)
+    y = df["label"].to_numpy(dtype=np.float32)
     return X, y, available
 
 
@@ -95,14 +95,14 @@ def save_shap(
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as f:
         f.create_dataset("shap_values",  data=shap_vals, compression="gzip")
-        f.create_dataset("labels",       data=df["label"].values)
+        f.create_dataset("labels",       data=df["label"].to_numpy(dtype=np.float32))
         f.create_dataset("feature_names", data=np.array(feature_names, dtype="S"))
         if "guide_name" in df.columns:
             f.create_dataset("guide_names",
-                             data=np.array(df["guide_name"].values, dtype="S"))
+                             data=np.array(df["guide_name"].to_numpy(dtype="S"), dtype="S"))
         if "sgRNA_seq" in df.columns:
             f.create_dataset("sgrna_seqs",
-                             data=np.array(df["sgRNA_seq"].values, dtype="S"))
+                             data=np.array(df["sgRNA_seq"].to_numpy(dtype="S"), dtype="S"))
     log.info("SHAP salvati: %s  shape=%s", path, shap_vals.shape)
 
 
