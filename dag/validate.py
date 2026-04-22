@@ -1,60 +1,114 @@
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+DAG_EDGES_TO_VALIDATE: list[tuple[str, str, str]] = [
+    ("node_A_pam", "pam_score", "positive"),
+    ("node_B_proximal", "mismatch_rate", "positive"),
+    ("node_C_seed_extension", "mismatch_rate", "positive"),
+    ("node_D_non_seed", "mismatch_rate", "positive"),
+    ("mean_energy_penalty", "mismatch_rate", "positive"),
+]
+
+
+def _direction_from_correlation(value: float) -> str:
+    if np.isnan(value):
+        return "undefined"
+    if value > 0:
+        return "positive"
+    if value < 0:
+        return "negative"
+    return "flat"
+
+
+def validate_dag(df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str]] = []
+    for source, target, expected_direction in DAG_EDGES_TO_VALIDATE:
+        if source not in df.columns or target not in df.columns:
+            rows.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "expected_direction": expected_direction,
+                    "spearman": float("nan"),
+                    "direction": "missing",
+                    "status": "missing_columns",
+                }
+            )
+            continue
+
+        spearman = float(df[source].corr(df[target], method="spearman"))
+        observed_direction = _direction_from_correlation(spearman)
+        status = "pass" if observed_direction == expected_direction else "fail"
+
+        rows.append(
+            {
+                "source": source,
+                "target": target,
+                "expected_direction": expected_direction,
+                "spearman": spearman,
+                "direction": observed_direction,
+                "status": status,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def empirical_sensitivity_profile(df: pd.DataFrame) -> np.ndarray:
+    profile_columns = [f"profile_pos_{idx:02d}" for idx in range(1, 21)]
+    if not set(profile_columns).issubset(df.columns):
+        return analytic_prior()
+
+    profile_df = df
+    if "label" in df.columns and (df["label"] > 0).any():
+        profile_df = df[df["label"] > 0]
+
+    profile = profile_df[profile_columns].mean(axis=0).to_numpy(dtype=float)
+    profile = np.clip(profile, a_min=0.0, a_max=None)
+    total = float(profile.sum())
+    if total <= 0:
+        return analytic_prior()
+    return profile / total
+
+
+def analytic_prior(decay_rate: float = 0.20) -> np.ndarray:
+    # Position 1 is PAM-proximal, so highest prior mass starts at index 0.
+    positions = np.arange(20)
+    prior = np.exp(-decay_rate * positions)
+    return prior / prior.sum()
 
 
 def validate_dag_edges(features_df: pd.DataFrame) -> list[str]:
-    issues: list[str] = []
-
-    expected = {
-        "pam_score",
-        "mismatch_count",
-        "seed_mismatch_count",
-        "mean_energy_penalty",
-        "total_energy_penalty",
-    }
-    missing = expected - set(features_df.columns)
-    if missing:
-        issues.append(f"Missing required columns: {sorted(missing)}")
-        return issues
-
-    bad_pam = ~features_df["pam_score"].between(0, 1)
-    if bad_pam.any():
-        issues.append("Found pam_score values outside [0, 1].")
-
-    bad_seed = features_df["seed_mismatch_count"] > features_df["mismatch_count"]
-    if bad_seed.any():
-        issues.append("seed_mismatch_count is greater than mismatch_count in some rows.")
-
-    bad_energy = features_df["mean_energy_penalty"] < 0
-    if bad_energy.any():
-        issues.append("Found negative mean_energy_penalty values.")
-
+    # Backward compatibility helper used by existing scripts.
+    report = validate_dag(features_df)
+    issues = []
+    for _, row in report.iterrows():
+        if row["status"] != "pass":
+            issues.append(f"{row['source']} -> {row['target']}: {row['status']}")
     return issues
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate DAG relationships on processed data.")
-    parser.add_argument(
-        "--features",
-        type=Path,
-        default=Path("data/processed/features/features.parquet"),
-        help="Parquet file with engineered features",
-    )
+    parser = argparse.ArgumentParser(description="Validate DAG edges on engineered features")
+    parser.add_argument("--features", type=Path, required=True, help="Parquet file with engineered features")
+    parser.add_argument("--report-out", type=Path, default=None, help="Optional output CSV for validation report")
     args = parser.parse_args()
 
     if not args.features.exists():
         raise SystemExit(f"Features file not found: {args.features}")
 
     features_df = pd.read_parquet(args.features)
-    errors = validate_dag_edges(features_df)
-    if errors:
-        for error in errors:
-            print(f"[ERROR] {error}")
-        raise SystemExit(1)
+    report_df = validate_dag(features_df)
+    print(report_df.to_string(index=False))
 
-    print("DAG validation passed.")
+    empirical_prior = empirical_sensitivity_profile(features_df)
+    print("Empirical prior (first 5):", empirical_prior[:5])
+
+    if args.report_out is not None:
+        args.report_out.parent.mkdir(parents=True, exist_ok=True)
+        report_df.to_csv(args.report_out, index=False)
 
 
 if __name__ == "__main__":

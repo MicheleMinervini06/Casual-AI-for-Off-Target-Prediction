@@ -1,14 +1,15 @@
 """Biological DAG primitives for CRISPR feature engineering."""
 
-from dag.concepts import to_concept_dict
-from dag.features import build_feature_dataframe
+from dag.features import build_features, create_guide_split, load_raw
+from dag.mismatch import classify_mismatch
 from dag.nodes import CRISPRPairFeatures
-from dag.pam import PAM_COMPATIBILITY, pam_score
+from dag.pam import pam_score
 
 __all__ = [
+    "build_features",
+    "classify_mismatch",
     "CRISPRPairFeatures",
-    "PAM_COMPATIBILITY",
-    "build_feature_dataframe",
+    "create_guide_split",
+    "load_raw",
     "pam_score",
-    "to_concept_dict",
 ]

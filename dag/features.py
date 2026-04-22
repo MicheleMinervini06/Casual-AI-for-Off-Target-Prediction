@@ -2,85 +2,226 @@ import argparse
 from pathlib import Path
 from typing import Iterable
 
+import h5py
+import numpy as np
 import pandas as pd
 
-from dag.energy import positional_energy_profile
-from dag.mismatch import mismatch_type
 from dag.nodes import CRISPRPairFeatures
-from dag.pam import pam_score
+
+STANDARD_COLUMNS = ["sgRNA_seq", "off_seq", "label", "guide_name", "reads", "assay"]
+
+COLUMN_CANDIDATES: dict[str, list[str]] = {
+    "sgRNA_seq": ["sgrna_seq", "sgrna", "guide_seq", "guide", "grna", "on_seq"],
+    "off_seq": ["off_seq", "offtarget_seq", "offtarget", "target_seq", "target"],
+    "label": ["label", "y", "class", "is_offtarget", "active"],
+    "guide_name": ["guide_name", "guide_id", "sgrna_id", "guide"],
+    "reads": ["reads", "read_count", "counts", "n_reads", "count"],
+    "assay": ["assay", "dataset", "source", "assay_type"],
+}
 
 
-def _gc_content(sequence: str) -> float:
-    if not sequence:
-        return 0.0
-    seq = sequence.upper()
-    return (seq.count("G") + seq.count("C")) / len(seq)
+def _read_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix in {".tsv", ".txt"}:
+        return pd.read_csv(path, sep="\t")
+    if suffix == ".parquet":
+        return pd.read_parquet(path)
+    raise ValueError(f"Unsupported file extension: {path.suffix}")
 
 
-def _pair_to_row(pair: CRISPRPairFeatures) -> dict[str, float | str | int]:
-    length = min(len(pair.guide_seq), len(pair.target_seq))
-    mismatch_flags = []
-    for i in range(length):
-        mismatch_flags.append(mismatch_type(pair.guide_seq[i], pair.target_seq[i]) != "match")
+def _standardize_columns(raw: pd.DataFrame, dataset_type: str) -> pd.DataFrame:
+    lower_to_original = {column.lower(): column for column in raw.columns}
+    out = pd.DataFrame(index=raw.index)
 
-    energy = positional_energy_profile(pair.guide_seq, pair.target_seq)
-    mismatch_count = int(sum(mismatch_flags))
-    seed_mismatch_count = int(sum(mismatch_flags[:10]))
+    for standard_name, candidates in COLUMN_CANDIDATES.items():
+        selected = None
+        for candidate in candidates:
+            original = lower_to_original.get(candidate.lower())
+            if original is not None:
+                selected = original
+                break
+        if selected is not None:
+            out[standard_name] = raw[selected]
 
-    return {
-        "guide_seq": pair.guide_seq,
-        "target_seq": pair.target_seq,
-        "pam": pair.pam,
-        "assay": pair.assay,
-        "enzyme": pair.enzyme,
-        "guide_length": pair.guide_length,
-        "pam_score": pam_score(pair.pam, pair.enzyme),
-        "mismatch_count": mismatch_count,
-        "seed_mismatch_count": seed_mismatch_count,
-        "gc_guide": _gc_content(pair.guide_seq),
-        "gc_target": _gc_content(pair.target_seq),
-        "mean_energy_penalty": float(energy.mean()) if len(energy) else 0.0,
-        "total_energy_penalty": float(energy.sum()),
-    }
+    if "sgRNA_seq" not in out.columns or "off_seq" not in out.columns:
+        missing = [name for name in ["sgRNA_seq", "off_seq"] if name not in out.columns]
+        raise ValueError(f"Missing mandatory raw columns: {missing}")
+
+    if "label" not in out.columns:
+        out["label"] = 0
+    if "guide_name" not in out.columns:
+        out["guide_name"] = out["sgRNA_seq"]
+    if "reads" not in out.columns:
+        out["reads"] = np.nan
+    if "assay" not in out.columns:
+        out["assay"] = dataset_type
+
+    out["sgRNA_seq"] = out["sgRNA_seq"].astype(str).str.upper().str.replace("U", "T", regex=False)
+    out["off_seq"] = out["off_seq"].astype(str).str.upper().str.replace("U", "T", regex=False)
+    out["guide_name"] = out["guide_name"].astype(str)
+    out["label"] = pd.to_numeric(out["label"], errors="coerce").fillna(0.0)
+    out["label"] = (out["label"] > 0).astype(int)
+    out["reads"] = pd.to_numeric(out["reads"], errors="coerce")
+    out["assay"] = out["assay"].astype(str)
+    return out[STANDARD_COLUMNS]
+
+
+def load_raw(path: str | Path, dataset_type: str = "auto") -> pd.DataFrame:
+    input_path = Path(path)
+
+    if input_path.is_file():
+        frames = [_standardize_columns(_read_table(input_path), dataset_type)]
+    elif input_path.is_dir():
+        files = sorted(
+            p for p in input_path.rglob("*") if p.suffix.lower() in {".csv", ".tsv", ".txt", ".parquet"}
+        )
+        frames = []
+        for file_path in files:
+            assay_name = dataset_type if dataset_type != "auto" else file_path.parent.name
+            frames.append(_standardize_columns(_read_table(file_path), assay_name))
+    else:
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+
+    if not frames:
+        return pd.DataFrame(columns=STANDARD_COLUMNS)
+    return pd.concat(frames, ignore_index=True)
+
+
+def build_features(df: pd.DataFrame, vectors_out: str | Path | None = None) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    mm_vectors: list[np.ndarray] = []
+    type_vectors: list[np.ndarray] = []
+    energy_vectors: list[np.ndarray] = []
+    profiles: list[np.ndarray] = []
+
+    for _, row in df.iterrows():
+        pair = CRISPRPairFeatures(
+            sgRNA_seq=str(row["sgRNA_seq"]),
+            off_seq=str(row["off_seq"]),
+            assay=str(row.get("assay", "unknown")),
+            guide_name=str(row.get("guide_name", "unknown")),
+        )
+
+        features = pair.to_feature_dict()
+        features["label"] = int(row.get("label", 0))
+        reads_value = row.get("reads", np.nan)
+        features["reads"] = float(reads_value) if pd.notna(reads_value) else np.nan
+
+        concepts = pair.to_concept_dict()
+        features.update(concepts)
+
+        rows.append(features)
+        mm_vectors.append(pair.mm_vector)
+        type_vectors.append(pair.type_vector)
+        energy_vectors.append(pair.energy_vector)
+        profiles.append(pair.to_position_profile())
+
+    feature_df = pd.DataFrame(rows)
+
+    if vectors_out is not None:
+        vector_path = Path(vectors_out)
+        vector_path.parent.mkdir(parents=True, exist_ok=True)
+        with h5py.File(vector_path, mode="w") as h5:
+            h5.create_dataset("mm_vector", data=np.asarray(mm_vectors, dtype=np.int8))
+            h5.create_dataset("type_vector", data=np.asarray(type_vectors, dtype=np.int8))
+            h5.create_dataset("energy_vector", data=np.asarray(energy_vectors, dtype=float))
+            h5.create_dataset("position_profile", data=np.asarray(profiles, dtype=float))
+    return feature_df
+
+
+def create_guide_split(
+    df: pd.DataFrame,
+    train_size: float = 0.70,
+    val_size: float = 0.15,
+    test_size: float = 0.15,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if not np.isclose(train_size + val_size + test_size, 1.0):
+        raise ValueError("train_size + val_size + test_size must sum to 1.0")
+
+    split_df = df.copy()
+    if "guide_name" not in split_df.columns:
+        split_df["guide_name"] = split_df["sgRNA_seq"].astype(str)
+
+    unique_guides = np.asarray(sorted(split_df["guide_name"].astype(str).unique()))
+    if len(unique_guides) < 3:
+        raise ValueError("At least 3 unique guides are required to build train/val/test splits")
+
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(unique_guides)
+
+    n_guides = len(shuffled)
+    n_train = max(1, int(np.floor(train_size * n_guides)))
+    n_val = max(1, int(np.floor(val_size * n_guides)))
+    n_test = n_guides - n_train - n_val
+
+    if n_test <= 0:
+        n_test = 1
+        if n_train > n_val:
+            n_train -= 1
+        else:
+            n_val -= 1
+
+    train_guides = set(shuffled[:n_train])
+    val_guides = set(shuffled[n_train : n_train + n_val])
+    test_guides = set(shuffled[n_train + n_val : n_train + n_val + n_test])
+
+    if (train_guides & val_guides) or (train_guides & test_guides) or (val_guides & test_guides):
+        raise RuntimeError("Guide leakage detected while building splits")
+
+    train_df = split_df[split_df["guide_name"].isin(train_guides)].reset_index(drop=True)
+    val_df = split_df[split_df["guide_name"].isin(val_guides)].reset_index(drop=True)
+    test_df = split_df[split_df["guide_name"].isin(test_guides)].reset_index(drop=True)
+    return train_df, val_df, test_df
 
 
 def build_feature_dataframe(pairs: Iterable[CRISPRPairFeatures]) -> pd.DataFrame:
-    rows = [_pair_to_row(pair) for pair in pairs]
+    # Backward compatibility helper for existing tests and notebooks.
+    rows: list[dict[str, float | str | int]] = []
+    for pair in pairs:
+        row = pair.to_feature_dict()
+        row["gc_guide"] = float(row["gc_sgRNA"])
+        row["gc_target"] = float(row["gc_offtarget"])
+        row["seed_mismatch_count"] = int(np.sum(pair.mm_vector[:10]))
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-def _load_raw_pairs(input_dir: Path) -> list[CRISPRPairFeatures]:
-    pairs: list[CRISPRPairFeatures] = []
-    for csv_path in sorted(input_dir.rglob("*.csv")):
-        raw = pd.read_csv(csv_path)
-        required = {"guide_seq", "target_seq", "pam"}
-        if not required.issubset(raw.columns):
-            continue
-
-        for _, row in raw.iterrows():
-            pairs.append(
-                CRISPRPairFeatures(
-                    guide_seq=str(row["guide_seq"]),
-                    target_seq=str(row["target_seq"]),
-                    pam=str(row["pam"]),
-                    assay=str(row.get("assay", csv_path.parent.name)),
-                    enzyme=str(row.get("enzyme", "SpCas9")),
-                )
-            )
-    return pairs
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build DAG features from raw assay files.")
-    parser.add_argument("--input", type=Path, required=True, help="Input raw data directory")
-    parser.add_argument("--output", type=Path, required=True, help="Output parquet path")
+    parser = argparse.ArgumentParser(description="DAG feature pipeline")
+    parser.add_argument("--input", type=Path, required=True, help="Raw input file or directory")
+    parser.add_argument("--dataset-type", type=str, default="auto", help="changeseq | guideseq | cclmoff | auto")
+    parser.add_argument("--output", type=Path, required=True, help="Output parquet file")
+    parser.add_argument("--vectors-out", type=Path, default=None, help="Optional HDF5 path for vector outputs")
+    parser.add_argument("--split-out-dir", type=Path, default=None, help="Optional directory for train/val/test parquet")
+    parser.add_argument("--train-size", type=float, default=0.70)
+    parser.add_argument("--val-size", type=float, default=0.15)
+    parser.add_argument("--test-size", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    pairs = _load_raw_pairs(args.input)
-    features_df = build_feature_dataframe(pairs)
+    raw_df = load_raw(args.input, dataset_type=args.dataset_type)
+    feature_df = build_features(raw_df, vectors_out=args.vectors_out)
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    features_df.to_parquet(args.output, index=False)
-    print(f"Saved {len(features_df)} rows to {args.output}")
+    feature_df.to_parquet(args.output, index=False)
+
+    if args.split_out_dir is not None:
+        args.split_out_dir.mkdir(parents=True, exist_ok=True)
+        train_df, val_df, test_df = create_guide_split(
+            feature_df,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            seed=args.seed,
+        )
+        train_df.to_parquet(args.split_out_dir / "train.parquet", index=False)
+        val_df.to_parquet(args.split_out_dir / "val.parquet", index=False)
+        test_df.to_parquet(args.split_out_dir / "test.parquet", index=False)
+
+    print(f"Loaded {len(raw_df)} rows; generated {len(feature_df)} feature rows")
 
 
 if __name__ == "__main__":
