@@ -63,19 +63,23 @@ ablation:
         - profile_pos_11
         - profile_pos_12
 
-    - name: no_energy
+    - name: no_aggregate_energy
       exclude_cols:
-        # Rimuoviamo tutte le metriche legate all'energia complessiva
         - mean_energy_penalty
         - total_energy_penalty
         - concept_energy
-        # TODO - Valutare se rimuovere anche i nodi energetici specifici della regione seed
-        # - node_B_proximal
-        # - node_C_seed_extension
-        # - node_D_non_seed
-        # - concept_proximal_load
-        # - concept_seed_extension_load
-        # - concept_non_seed_load
+
+    - name: no_energy_full
+      exclude_cols:
+        - mean_energy_penalty
+        - total_energy_penalty
+        - concept_energy
+        - node_B_proximal
+        - node_C_seed_extension
+        - node_D_non_seed
+        - concept_proximal_load
+        - concept_seed_extension_load
+        - concept_non_seed_load   
 
     - name: full_dag
       feature_cols: null
