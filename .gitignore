@@ -21,3 +21,6 @@ data/logs/*.h5
 
 # Experimental outputs
 experiments/results/*
+
+# Catboost info
+catboost_info/
