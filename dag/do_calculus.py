@@ -7,20 +7,20 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from pgmpy.inference import CausalInference
-from pgmpy.models import BayesianNetwork
+from pgmpy.models import DiscreteBayesianNetwork as _PgmpyBayesModel
 
+# Fix: Importiamo l'SCM parametrico canonico
 from dag.scm import CRISPRCausalModel
 
-# child -> parents
+
+# Fix: DAG potato in perfetta coerenza con scm.py (rimossi energia e non-seed)
 DEFAULT_DAG: dict[str, list[str]] = {
     "pam_score": ["node_A_pam"],
     "mismatch_rate": [
         "node_B_proximal",
         "node_C_seed_extension",
-        "node_D_non_seed",
-        "mean_energy_penalty",
     ],
-    "label": ["pam_score", "node_B_proximal", "node_C_seed_extension", "node_D_non_seed"],
+    "label": ["pam_score", "node_B_proximal", "node_C_seed_extension"],
 }
 
 
@@ -73,20 +73,17 @@ def _propagate_scm_under_intervention(
             raise ValueError(f"Intervention key not in dataframe: {key}")
         out[key] = value
 
-    # Genera l'ordinamento topologico dinamicamente (Fix Architetturale)
     graph = _build_nx_graph(_ensure_dag(dag))
     try:
         topological_order = list(nx.topological_sort(graph))
     except nx.NetworkXUnfeasible:
         raise ValueError("Il DAG contiene cicli e non può essere ordinato topologicamente.")
 
-    # Mappiamo i target alle equazioni disponibili nell'SCM
     scm_equations = {
         eq.target: eq
         for eq in [scm.pam_equation, scm.mismatch_equation, scm.activity_equation]
     }
 
-    # Propaghiamo seguendo l'ordine del DAG
     for target in topological_order:
         if target in intervention or target not in scm_equations:
             continue
@@ -104,7 +101,6 @@ def _propagate_scm_under_intervention(
         else:
             out[target] = predicted
 
-    # Fallback nel caso estremo di do(label=x)
     if "activity_probability" not in out.columns:
         if "label" in intervention:
             out["activity_probability"] = np.clip(out["label"].to_numpy(dtype=float), 0.0, 1.0)
@@ -145,16 +141,14 @@ def backdoor_adjustment(
         for parent in parents:
             edges.append((parent, child))
 
-    model = BayesianNetwork(edges)
+    model = _PgmpyBayesModel(edges)
     inference = CausalInference(model)
     
-    # pgmpy estrae formalmente i set validi per il backdoor criterion
     backdoor_sets = inference.get_all_backdoor_adjustment_sets(treatment, outcome)
     
     if not backdoor_sets:
         return set()
         
-    # Restituisce il set più piccolo tra quelli validi
     return set(min(backdoor_sets, key=len))
 
 
@@ -216,12 +210,19 @@ def compare_observational_vs_interventional(
 def build_intervention_dataset(
     df: pd.DataFrame,
     interventions: list[dict[str, Any]],
+    scm: CRISPRCausalModel | None = None,
 ) -> pd.DataFrame:
-    """Generate a synthetic intervention dataset from observed rows."""
+    """Generate a synthetic intervention dataset from observed rows.
+
+    If ``scm`` is provided, downstream endogenous variables are propagated
+    through structural equations after each intervention.
+    """
     if len(df) == 0:
         raise ValueError("df cannot be empty")
     if not interventions:
         raise ValueError("interventions cannot be empty")
+    if scm is not None and not scm.fitted:
+        raise RuntimeError("SCM must be fitted before propagation")
 
     blocks: list[pd.DataFrame] = []
     base = df.reset_index(drop=False).rename(columns={"index": "source_index"})
@@ -235,6 +236,10 @@ def build_intervention_dataset(
                 if key not in block.columns:
                     raise ValueError(f"Intervention key not in dataframe: {key}")
                 block[key] = value
+
+            if scm is not None:
+                block = _propagate_scm_under_intervention(scm, block, expanded)
+
             block["intervention_id"] = f"int_{idx:03d}_{jdx:03d}"
             block["intervention_spec"] = str(dict(sorted(expanded.items())))
             block["is_intervened"] = 1

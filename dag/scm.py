@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping
+from typing import Literal, Mapping
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 
 from dag.nodes import CRISPRPairFeatures
 
-# Aggiunte le forme per i modelli ad albero
-EquationForm = Literal["linear", "multiplicative", "sigmoid", "tree_regressor", "tree_classifier"]
+
+EquationForm = Literal["linear", "multiplicative", "sigmoid"]
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -46,7 +45,6 @@ class StructuralEquation:
     intercept: float = 0.0
     noise_std: float = 1.0
     fitted: bool = False
-    model: Any = field(default=None)  # Contenitore per modelli sklearn (es. HistGradientBoosting)
 
     def fit(self, df: pd.DataFrame) -> "StructuralEquation":
         _require_columns(df, [self.target] + self.parents, f"equation {self.target}")
@@ -73,7 +71,7 @@ class StructuralEquation:
             self.coefficients = np.asarray(params[1:], dtype=float)
             y_hat = self.intercept + (X @ self.coefficients)
 
-        elif self.form == "sigmoid":
+        else:  # sigmoid / Bernoulli likelihood (logistic MLE)
             y_binary = (y > 0).astype(int)
             if np.unique(y_binary).size < 2:
                 base_rate = float(np.clip(y_binary.mean(), 1e-6, 1.0 - 1e-6))
@@ -82,35 +80,15 @@ class StructuralEquation:
                 y_hat = np.full(len(y_binary), base_rate, dtype=float)
             else:
                 clf = LogisticRegression(
-                    C=1e6, fit_intercept=True, solver="lbfgs", max_iter=1000
+                    C=1e6,
+                    fit_intercept=True,
+                    solver="lbfgs",
+                    max_iter=1000,
                 )
                 clf.fit(X, y_binary)
                 self.intercept = float(clf.intercept_[0])
                 self.coefficients = np.asarray(clf.coef_[0], dtype=float)
                 y_hat = clf.predict_proba(X)[:, 1]
-
-        elif self.form == "tree_regressor":
-            self.model = HistGradientBoostingRegressor(
-                max_iter=100, max_depth=5, early_stopping=False, random_state=42
-            )
-            self.model.fit(X, y)
-            y_hat = self.model.predict(X)
-            # Dummy values per mantenere coerenza di interfaccia
-            self.intercept = 0.0
-            self.coefficients = np.zeros(X.shape[1], dtype=float)
-
-        elif self.form == "tree_classifier":
-            y_binary = (y > 0).astype(int)
-            self.model = HistGradientBoostingClassifier(
-                max_iter=100, max_depth=5, early_stopping=False, random_state=42
-            )
-            self.model.fit(X, y_binary)
-            y_hat = self.model.predict_proba(X)[:, 1]
-            self.intercept = 0.0
-            self.coefficients = np.zeros(X.shape[1], dtype=float)
-
-        else:
-            raise ValueError(f"Unknown equation form: {self.form}")
 
         residual = y - y_hat
         self.noise_std = float(max(np.std(residual), 1e-8))
@@ -118,32 +96,31 @@ class StructuralEquation:
         return self
 
     def linear_predictor(self, df: pd.DataFrame) -> np.ndarray:
-        """Return pre-link linear predictor. Invalid for tree models."""
+        """Return pre-link linear predictor (intercept + X @ beta).
+
+        For multiplicative equations this corresponds to beta * x.
+        """
         if not self.fitted:
             raise RuntimeError(f"Equation {self.target} is not fitted")
-        if self.form in ("tree_regressor", "tree_classifier"):
-            raise TypeError(f"linear_predictor is undefined for tree-based form '{self.form}'")
 
         X = _as_matrix(df, self.parents)
+
         if self.form == "multiplicative":
             z = self.coefficients[0] * X[:, 0]
         else:
             z = self.intercept + (X @ self.coefficients)
+
         return np.asarray(z, dtype=float)
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
-        if not self.fitted:
-            raise RuntimeError(f"Equation {self.target} is not fitted")
-
-        if self.form == "tree_regressor":
-            return self.model.predict(_as_matrix(df, self.parents))
-        if self.form == "tree_classifier":
-            return self.model.predict_proba(_as_matrix(df, self.parents))[:, 1]
-
         z = self.linear_predictor(df)
+
         if self.form == "sigmoid":
-            return _sigmoid(z)
-        return z
+            y_hat = _sigmoid(z)
+        else:
+            y_hat = z
+
+        return np.asarray(y_hat, dtype=float)
 
     def sample_noise(self, df: pd.DataFrame, observed: np.ndarray | None = None) -> np.ndarray:
         if observed is None:
@@ -155,12 +132,12 @@ class StructuralEquation:
 
 @dataclass(slots=True)
 class CRISPRCausalModel:
-    """Non-parametric SCM aligned with the engineered DAG concepts.
+    """Parametric SCM aligned with Phase 2 goals (Interpretability & Identifiability).
 
-    Equations:
+    Equations (Simplified DAG):
     1) pam_score <- alpha * node_A_pam                    (multiplicative)
-    2) mismatch_rate <- tree(B, C, D, mean_energy)        (tree_regressor)
-    3) label <- tree(pam, B, C, D)                        (tree_classifier)
+    2) mismatch_rate <- linear(node_B, node_C)            (linear)
+    3) label <- sigmoid(pam, node_B, node_C)              (sigmoid)
     """
 
     pam_equation: StructuralEquation = field(
@@ -173,15 +150,17 @@ class CRISPRCausalModel:
     mismatch_equation: StructuralEquation = field(
         default_factory=lambda: StructuralEquation(
             target="mismatch_rate",
-            parents=["node_B_proximal", "node_C_seed_extension", "node_D_non_seed", "mean_energy_penalty"],
-            form="tree_regressor",
+            # Rimosso mean_energy_penalty e node_D_non_seed
+            parents=["node_B_proximal", "node_C_seed_extension"], 
+            form="linear",
         )
     )
     activity_equation: StructuralEquation = field(
         default_factory=lambda: StructuralEquation(
             target="label",
-            parents=["pam_score", "node_B_proximal", "node_C_seed_extension", "node_D_non_seed"],
-            form="tree_classifier",
+            # Rimosso node_D_non_seed
+            parents=["pam_score", "node_B_proximal", "node_C_seed_extension"],
+            form="sigmoid",
         )
     )
     fitted: bool = False
@@ -195,8 +174,6 @@ class CRISPRCausalModel:
             "pam_score",
             "node_B_proximal",
             "node_C_seed_extension",
-            "node_D_non_seed",
-            "mean_energy_penalty",
             "mismatch_rate",
             "label",
         }
@@ -205,12 +182,29 @@ class CRISPRCausalModel:
         self.pam_equation.fit(df)
         self.mismatch_equation.fit(df)
 
+        # Use the fitted PAM equation output to keep structural consistency.
         state = df.copy()
         state["pam_score"] = self.pam_equation.predict(state)
         self.activity_equation.fit(state)
 
         self.fitted = True
         return self
+
+    def parameters(self) -> dict[str, float]:
+        """Return explicitly labeled structural parameters for biological interpretation."""
+        if not self.fitted:
+            raise RuntimeError("SCM must be fitted before accessing parameters")
+
+        return {
+            "pam_alpha": float(self.pam_equation.coefficients[0]),
+            "mismatch_intercept": float(self.mismatch_equation.intercept),
+            "mismatch_beta_proximal": float(self.mismatch_equation.coefficients[0]),
+            "mismatch_gamma_seed": float(self.mismatch_equation.coefficients[1]),
+            "activity_intercept": float(self.activity_equation.intercept),
+            "activity_delta_pam": float(self.activity_equation.coefficients[0]),
+            "activity_eta_proximal": float(self.activity_equation.coefficients[1]),
+            "activity_theta_seed": float(self.activity_equation.coefficients[2]),
+        }
 
     def _pair_to_state(self, pair: CRISPRPairFeatures | Mapping[str, float] | tuple[str, str]) -> dict[str, float]:
         if isinstance(pair, CRISPRPairFeatures):
@@ -227,8 +221,6 @@ class CRISPRCausalModel:
             "pam_score",
             "node_B_proximal",
             "node_C_seed_extension",
-            "node_D_non_seed",
-            "mean_energy_penalty",
             "mismatch_rate",
         }
         missing = [name for name in sorted(needed) if name not in raw]
@@ -270,10 +262,7 @@ class CRISPRCausalModel:
         pair: CRISPRPairFeatures | Mapping[str, float] | tuple[str, str],
         observed_activity: float,
     ) -> dict[str, float]:
-        """Infer exogenous noises (abduction) non-parametrically.
-        
-        Logit residuals are approximated safely for tree models using _logit(P_hat).
-        """
+        """Infer exogenous noises (abduction) for a single pair."""
         if not self.fitted:
             raise RuntimeError("SCM must be fitted before abduction")
 
@@ -284,15 +273,12 @@ class CRISPRCausalModel:
         observed_activity_clipped = float(np.clip(observed_activity, 1e-6, 1.0 - 1e-6))
 
         frame_cf = pd.DataFrame([{**observed_state, "pam_score": predicted["pam_score"]}])
-        
-        # Abduzione sicura per modelli ad albero senza linear_predictor
-        predicted_prob_cf = float(self.activity_equation.predict(frame_cf)[0])
-        predicted_logit_cf = _logit(predicted_prob_cf)
+        predicted_logit = float(self.activity_equation.linear_predictor(frame_cf)[0])
 
         u_pam = observed_state["pam_score"] - predicted["pam_score"]
         u_mismatch = observed_state["mismatch_rate"] - predicted["mismatch_rate"]
         u_activity_probability = observed_activity - predicted["activity_probability"]
-        u_activity_logit = _logit(observed_activity_clipped) - predicted_logit_cf
+        u_activity_logit = _logit(observed_activity_clipped) - predicted_logit
 
         return {
             "u_pam": float(u_pam),

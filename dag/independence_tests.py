@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, cast
 
 import numpy as np
 import pandas as pd
-from pgmpy.models import BayesianNetwork
+from pgmpy.base import DAG  # <-- FIX: Modulo puramente topologico, supporta continue e discrete
 from scipy import stats
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.model_selection import KFold
 
+# Assicurati che questo import punti al tuo file do_calculus aggiornato con il DAG potato
 from dag.do_calculus import DEFAULT_DAG
+
+
+def _iter_independence_assertions(independencies: Any) -> Iterable[Any]:
+    """Rende uniforme l'accesso alle assertion per versioni pgmpy diverse."""
+    getter = getattr(independencies, "get_assertions", None)
+    if callable(getter):
+        return cast(Iterable[Any], getter())
+    if isinstance(independencies, list):
+        return independencies
+    return []
 
 
 def _ensure_dag(dag: Mapping[str, list[str]] | None) -> dict[str, list[str]]:
@@ -44,7 +55,6 @@ def _holm_bonferroni(p_values: np.ndarray) -> np.ndarray:
     adj_p = np.empty(m, dtype=float)
     current_max = 0.0
     for i, p_val in enumerate(sorted_p):
-        # Formula di Holm: p * (m - i)
         val = p_val * (m - i)
         current_max = max(current_max, val)
         adj_p[i] = min(current_max, 1.0)
@@ -67,8 +77,7 @@ def _extract_minimal_d_separations(
     dag: Mapping[str, list[str]],
 ) -> list[ConditionalIndependenceSpec]:
     """
-    Estrae le indipendenze condizionate usando pgmpy con deduplicazione rigorosa 
-    per proteggere la potenza statistica della correzione FWER.
+    Estrae le indipendenze condizionate usando pgmpy.base.DAG con deduplicazione.
     """
     edges = []
     for child, parents in dag.items():
@@ -78,18 +87,22 @@ def _extract_minimal_d_separations(
     if not edges:
         return []
 
-    model = BayesianNetwork(edges)
+    # FIX: Usiamo un DAG puro, agnostico rispetto alla natura continua/discreta dei dati
+    model = DAG(edges)
     independencies = model.get_independencies()
     
     specs: list[ConditionalIndependenceSpec] = []
     seen_signatures = set()
     
-    for assertion in independencies.get_assertions():
-        for x in assertion.event1:
-            for y in assertion.event2:
-                # Ordinamento canonico per eliminare simmetrie
+    for assertion in _iter_independence_assertions(independencies):
+        event1 = list(getattr(assertion, "event1", []))
+        event2 = list(getattr(assertion, "event2", []))
+        event3 = getattr(assertion, "event3", None)
+        for x in event1:
+            for y in event2:
                 node_a, node_b = sorted([x, y])
-                cond_set = tuple(sorted(assertion.event3))
+                cond_values = event3 if event3 is not None else []
+                cond_set = tuple(sorted(cond_values))
                 
                 signature = (node_a, node_b, cond_set)
                 
@@ -162,7 +175,6 @@ def test_conditional_independence(
     work = df[required].dropna().copy()
     n = len(work)
     
-    # DML richiede una soglia minima di dati per il K-Fold
     if n < max(20, len(z_cols) * 5): 
         return {**base_result, "n": int(n), "status": "insufficient_data"}
 
