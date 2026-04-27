@@ -1,0 +1,54 @@
+_base: experiments/configs/base.yaml
+
+experiment:
+  name: exp_02_scm
+  description: >
+    Phase 2 SCM experiment.
+    Validates DAG conditional-independence implications,
+    estimates SCM parameters, compares observational vs interventional responses,
+    computes baseline CCS, and builds synthetic intervention dataset.
+
+seed: 42
+
+phase2:
+  fit_split: train
+  evaluation_split: test
+
+independence:
+  alpha: 0.05
+  max_failure_rate: 0.30
+
+interventions:
+  # Each item supports scalar values or lists (cartesian expansion).
+  queries:
+    - name: do_pam_low
+      intervention:
+        pam_score: 0.20
+    - name: do_pam_high
+      intervention:
+        pam_score: 0.90
+    - name: do_seed_stress
+      intervention:
+        node_B_proximal: [0.75, 0.90]
+        node_C_seed_extension: [0.75, 0.90]
+
+  dataset:
+    - pam_score: [0.20, 0.50, 0.90]
+    - node_B_proximal: [0.20, 0.80]
+      node_C_seed_extension: [0.20, 0.80]
+
+baseline:
+  model_type: xgboost
+  model_path: experiments/results/exp_01_baseline/xgboost_model.pkl
+
+ccs:
+  enabled: true
+  mode: 3_rules
+  guide_source_split: test
+
+output:
+  independence_csv: dag_independence_tests.csv
+  scm_parameters_json: scm_parameters.json
+  observational_vs_do_csv: observational_vs_do.csv
+  ccs_baseline_json: ccs_baseline.json
+  intervention_dataset_parquet: intervention_dataset.parquet
