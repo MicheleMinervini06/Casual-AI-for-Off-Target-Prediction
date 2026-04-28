@@ -1,10 +1,11 @@
-from models.deep.cbm import CBMClassifier, ConceptBottleneckModel
-from models.deep.encoder import PairwiseTransformerClassifier, encode_pair_batch, encode_sequence
+from .neural_scm import NeuralSCM
+from .encoding import PairwiseTokenEncoder
+from .losses import NeuralSCMLoss
+from .train import train
 
 __all__ = [
-    "encode_sequence",
-    "encode_pair_batch",
-    "PairwiseTransformerClassifier",
-    "ConceptBottleneckModel",
-    "CBMClassifier",
+    "NeuralSCM",
+    "PairwiseTokenEncoder",
+    "NeuralSCMLoss",
+    "train"
 ]
