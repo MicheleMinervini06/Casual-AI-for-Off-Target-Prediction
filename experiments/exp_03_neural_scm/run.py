@@ -198,6 +198,21 @@ def main(config_path: Path) -> None:
 
     # 2. Initialise Hardware and NeuralSCM from config
     training_cfg = cfg.get("training", {})
+
+    # Calcolo dinamico di pos_weight dal training set (evita sbilanciamento manuale)
+    try:
+        n_neg = int((df_train["label"] == 0).sum())
+        n_pos = int((df_train["label"] == 1).sum())
+        if n_pos == 0:
+            log.warning("No positive examples in training split; using pos_weight=1.0")
+            training_cfg["pos_weight"] = 1.0
+        else:
+            training_cfg["pos_weight"] = float(n_neg) / float(n_pos)
+            log.info("pos_weight: %.1f", training_cfg["pos_weight"])
+    except Exception as exc:  # fallback sicuro
+        log.warning("Could not compute pos_weight dynamically: %s; defaulting to config or 1.0", exc)
+        training_cfg["pos_weight"] = float(training_cfg.get("pos_weight", 1.0))
+
     device = torch.device(training_cfg.get("device", "cpu"))
     log.info("Using device: %s", device)
 
@@ -218,6 +233,23 @@ def main(config_path: Path) -> None:
     model_path = results_dir / str(cfg.get("output", {}).get("model_pt", "neural_scm.pt"))
     torch.save(trained_model.state_dict(), model_path)
     log.info("Model saved: %s", model_path)
+
+    # Metriche su train/val/test, usando loader deterministici senza shuffle.
+    train_eval_loader = _make_loader(df_train, batch_size, shuffle=False)
+    train_metrics = evaluate(trained_model, train_eval_loader, device)
+    log.info("CHANGE-seq train: %s", train_metrics)
+    _save_json(
+        {"split": "changeseq_train", **_safe_float_dict(train_metrics)},
+        results_dir / str(cfg.get("output", {}).get("metrics_changeseq_train_json", "metrics_changeseq_train.json")),
+    )
+
+    val_loader = _make_loader(df_val, batch_size, shuffle=False)
+    val_metrics = evaluate(trained_model, val_loader, device)
+    log.info("CHANGE-seq val: %s", val_metrics)
+    _save_json(
+        {"split": "changeseq_val", **_safe_float_dict(val_metrics)},
+        results_dir / str(cfg.get("output", {}).get("metrics_changeseq_val_json", "metrics_changeseq_val.json")),
+    )
 
     # 4. Evaluate within-dataset (CHANGE-seq test)
     test_loader = _make_loader(df_test, batch_size, shuffle=False)

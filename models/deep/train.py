@@ -187,6 +187,15 @@ def train(
             f"Val AUPRC: {current_auprc:.4f} | Val AUROC: {val_metrics['auroc']:.4f}"
         )
 
+        # Log combiner weights after each epoch for monitoring
+        w_prox = float(getattr(model, "w_proximal").detach().cpu())
+        w_seed = float(getattr(model, "w_seed").detach().cpu())
+        w_nonseed = float(getattr(model, "w_nonseed").detach().cpu())
+        bias = float(getattr(model, "bias").detach().cpu())
+        logger.info(
+            f"  Combiner: w_prox={w_prox:.4f} w_seed={w_seed:.4f} w_nonseed={w_nonseed:.4f} bias={bias:.4f}"
+        )
+
         if current_auprc > best_auprc:
             best_auprc = current_auprc
             best_model_state = copy.deepcopy(model.state_dict())
