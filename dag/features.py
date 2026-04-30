@@ -171,20 +171,20 @@ def create_guide_split(
     if len(guide_stats) < 3:
         raise ValueError("At least 3 unique guides are required to build train/val/test splits")
 
-    # 2. Stratificazione per quartili
-    try:
-        guide_stats["activity_bin"] = pd.qcut(
-            guide_stats["n_positives"], 
-            q=4, 
-            labels=["specific", "low_promiscuity", "med_promiscuity", "high_promiscuity"]
-        )
-    except ValueError:
-        # Fallback robusto se le frequenze si accavallano troppo
-        guide_stats["activity_bin"] = pd.cut(
-            guide_stats["n_positives"], 
-            bins=4, 
-            labels=["specific", "low_promiscuity", "med_promiscuity", "high_promiscuity"]
-        )
+    # 2. Stratificazione robusta per quantili
+    # duplicates="drop" fonde automaticamente i quantili sovrapposti (es. tanti zero)
+    guide_stats["activity_bin"] = pd.qcut(
+        guide_stats["n_positives"], 
+        q=4, 
+        duplicates="drop"
+    ).astype(str)
+
+    # Protezione per Sklearn (Split 1): Nessun bin deve avere meno di 2 elementi
+    counts = guide_stats["activity_bin"].value_counts()
+    singletons = counts[counts < 2].index
+    if len(singletons) > 0:
+        majority_bin = counts.idxmax()
+        guide_stats["activity_bin"] = guide_stats["activity_bin"].replace(singletons, majority_bin)
 
     # 3. Split Train+Val vs Test
     train_val_guides, test_guides = train_test_split(
@@ -196,8 +196,16 @@ def create_guide_split(
     
     # 4. Split Train vs Val
     val_relative_size = val_size / (train_size + val_size)
-    train_val_stats = guide_stats[guide_stats["guide_name"].isin(train_val_guides)]
+    train_val_stats = guide_stats[guide_stats["guide_name"].isin(train_val_guides)].copy()
     
+    # Protezione per Sklearn (Split 2): Ricalcoliamo i singleton post-primo split
+    # (perché togliendo il test set, un bin da 2 elementi potrebbe essere rimasto con 1)
+    tv_counts = train_val_stats["activity_bin"].value_counts()
+    tv_singletons = tv_counts[tv_counts < 2].index
+    if len(tv_singletons) > 0:
+        tv_majority = tv_counts.idxmax()
+        train_val_stats["activity_bin"] = train_val_stats["activity_bin"].replace(tv_singletons, tv_majority)
+
     train_guides, val_guides = train_test_split(
         train_val_stats["guide_name"], 
         test_size=val_relative_size, 
@@ -205,7 +213,7 @@ def create_guide_split(
         stratify=train_val_stats["activity_bin"]
     )
 
-    # 5. Estrazione DataFrame
+    # 5. Estrazione DataFrame finali
     train_df = split_df[split_df["guide_name"].isin(train_guides)].reset_index(drop=True)
     val_df = split_df[split_df["guide_name"].isin(val_guides)].reset_index(drop=True)
     test_df = split_df[split_df["guide_name"].isin(test_guides)].reset_index(drop=True)
