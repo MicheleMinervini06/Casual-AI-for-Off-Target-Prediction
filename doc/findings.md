@@ -23,6 +23,39 @@ Documento di ricerca per tracciare osservazioni empiriche, anomalie e decisioni 
 
 ---
 
+### Aggiornamento — Risultati con nuovo split (exp_01)
+
+Analisi risultati exp_01 con nuovo split
+
+Metriche predittive
+- XGBoost:  AUPRC within=0.144  cross=0.270
+- CatBoost: AUPRC within=0.183  cross=0.231
+
+AUPRC within è sceso rispetto al run precedente (0.44/0.49) — atteso. Il test set ora è più rappresentativo e bilanciato. Il dato interessante è che cross-assay è migliorato per XGBoost (0.185→0.270) — il modello generalizza meglio con split corretto.
+
+DAG Validation — nuovo finding
+- node_C_seed_extension → label:  ρ=+0.011  atteso NEGATIVO  ✗ FAIL
+- node_D_non_seed       → label:  ρ=+0.071  atteso NEGATIVO  ✗ FAIL
+
+Con il nuovo split ora falliscono sia node_C che node_D — prima falliva solo node_D. Con il vecchio split le guide ricche di positivi nel val mascheravano questo pattern.
+
+Ablation — confermato
+- CatBoost no_energy_full:      0.2055  ← migliore
+- CatBoost no_aggregate_energy: 0.2019
+- CatBoost full_dag:            0.1829
+
+Il pattern precedente regge: le feature energetiche aggregate peggiorano la performance.
+
+Feature importance — segnale chiave
+- mismatch_count:  0.134  ← feature più importante
+- pam_score:       0.109
+- profile_pos_20:  0.076  ← posizione PAM-proximal
+- gc_sgRNA:        0.069
+- node_B_proximal: 0.015  ← nodo DAG poco usato
+- node_C_seed:     0.015
+
+XGBoost usa principalmente feature aggregate (mismatch_count, mismatch_rate) e il profilo posizionale, non i nodi DAG strutturati. Questo è coerente con R2=0.0 nel CCS — il modello non ha imparato l'effetto causale posizione-specifico.
+
 ### F2 — Feature energetiche aggregate peggiorano la performance
 
 **Esperimento:** ablation study con varianti `no_aggregate_energy`, `no_energy_full`, `full_dag`.

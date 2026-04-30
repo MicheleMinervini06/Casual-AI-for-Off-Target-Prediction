@@ -28,7 +28,7 @@ training:
 phase3:
   fit_split: train
   evaluation_split: test
-  max_fit_rows: 100000  # Subset per prototipazione rapida
+  max_fit_rows: null  # Subset per prototipazione rapida
   max_eval_rows: null
 
 baseline:
@@ -42,6 +42,8 @@ ccs:
 
 output:
   model_pt: neural_scm.pt
+  metrics_changeseq_train_json: metrics_changeseq_train.json
+  metrics_changeseq_val_json: metrics_changeseq_val.json
   metrics_changeseq_json: metrics_changeseq.json
   metrics_guideseq_json: metrics_guideseq.json
   ccs_neural_json: ccs_neural.json
