@@ -57,7 +57,7 @@ class SpacerRegionModule(nn.Module):
                 nhead=n_heads, 
                 dim_feedforward=hidden_dim,
                 batch_first=True,
-                dropout=0.1
+                dropout=0.3
             )
             self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
             self.head = nn.Linear(embed_dim, 1)
