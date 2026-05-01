@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoding import PairwiseTokenEncoder
+from .encoding import PairwiseTokenEncoder, BiologicalMismatchEncoder, BaseEncoder
 from .modules import NonSeedModule, PAMModule, ProximalModule, SeedExtensionModule
 
 
@@ -16,15 +16,20 @@ class NeuralSCM(nn.Module):
     Assembla moduli indipendenti in un DAG causale esplicito.
     """
 
-    def __init__(self, embed_dim: int = 16, hidden_dim: int = 32):
+    def __init__(self, embed_dim: int = 16, hidden_dim: int = 32, encoder: BaseEncoder | None = None):
         super().__init__()
         
-        self.encoder = PairwiseTokenEncoder(embed_dim=embed_dim)
+        # Se nessun encoder è fornito, usa PairwiseTokenEncoder di default
+        if encoder is None:
+            encoder = PairwiseTokenEncoder(embed_dim=embed_dim)
+        
+        self.encoder = encoder
+        self.embed_dim = encoder.embed_dim  # Adatta embed_dim all'encoder
 
-        self.pam_node = PAMModule(embed_dim=embed_dim, hidden_dim=hidden_dim)
-        self.proximal_node = ProximalModule(embed_dim=embed_dim)
-        self.seed_node = SeedExtensionModule(embed_dim=embed_dim)
-        self.nonseed_node = NonSeedModule(embed_dim=embed_dim)
+        self.pam_node = PAMModule(embed_dim=encoder.embed_dim, hidden_dim=hidden_dim)
+        self.proximal_node = ProximalModule(embed_dim=encoder.embed_dim)
+        self.seed_node = SeedExtensionModule(embed_dim=encoder.embed_dim)
+        self.nonseed_node = NonSeedModule(embed_dim=encoder.embed_dim)
 
         self.w_proximal = nn.Parameter(torch.randn(1))
         self.w_seed = nn.Parameter(torch.randn(1))

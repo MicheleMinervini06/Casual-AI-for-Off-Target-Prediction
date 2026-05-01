@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from dag.mismatch import classify_mismatch
+
 
 class BaseEncoder(nn.Module, ABC):
     """
@@ -139,3 +141,71 @@ class PairwiseTokenEncoder(BaseEncoder):
             encoded = F.one_hot(token_tensor, num_classes=len(self.ALPHABET)).float()
 
         return encoded
+
+
+class BiologicalMismatchEncoder(BaseEncoder):
+    """
+    Encoding esplicito biologicamente motivato.
+    Per ogni posizione produce un vettore con:
+    - tipo di mismatch (4 classi one-hot: match/wobble/transition/transversion)
+    - base sgRNA (4 classi one-hot: A/C/G/T)
+    - base target (4 classi one-hot: A/C/G/T)
+    Output: Tensor[B, 20, 12] — no parametri learnable nello spacer
+    """
+
+    MISMATCH_TYPES = {
+        "match": 0,
+        "wobble": 1,
+        "transition": 2,
+        "transversion": 3,
+    }
+    BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+
+    def __init__(self):
+        super().__init__()
+        self.embed_dim = 12  # fisso, no parametri
+        # Registra un buffer dummy per tracciare il device quando model.to(device) è chiamato
+        self.register_buffer("_device_tracker", torch.zeros(1))
+
+    def encode(self, sgrnas: list[str], off_targets: list[str]) -> torch.Tensor:
+        """
+        Encoding biologicamente motivato dello spacer (20 bp).
+        Restituisce: Tensor[B, 20, 12] con one-hot concatenati.
+        """
+        B = len(sgrnas)
+        device = self._device_tracker.device
+        out = torch.zeros(B, 20, 12, dtype=torch.float32, device=device)
+
+        for b, (sg, ot) in enumerate(zip(sgrnas, off_targets)):
+            sg = sg[:20].ljust(20, "N")
+            ot = ot[:20].ljust(20, "N")
+
+            for i, (bg, bt) in enumerate(zip(sg, ot)):
+                mt = classify_mismatch(bg, bt)  # restituisce MismatchType string
+
+                # One-hot tipo mismatch (4 dim)
+                out[b, i, self.MISMATCH_TYPES[mt]] = 1.0
+                # One-hot base sgRNA (4 dim)
+                out[b, i, 4 + self.BASE_IDX[bg.upper()]] = 1.0
+                # One-hot base target (4 dim)
+                out[b, i, 8 + self.BASE_IDX[bt.upper()]] = 1.0
+
+        return out
+
+    def encode_pam(self, off_targets: list[str]) -> torch.Tensor:
+        """
+        Encoding PAM (3 bp): 5 classi one-hot (A/C/G/T/N) paddate a embed_dim=12.
+        Restituisce: Tensor[B, 3, 12] per coerenza con lo spacer encoding.
+        """
+        B = len(off_targets)
+        device = self._device_tracker.device
+        # Crea output (B, 3, 12) — i primi 5 dim sono one-hot, il resto è zero padding
+        out = torch.zeros(B, 3, 12, dtype=torch.float32, device=device)
+        BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
+
+        for b, ot in enumerate(off_targets):
+            pam = (ot[20:23] if len(ot) >= 23 else "NNN").ljust(3, "N")
+            for i, base in enumerate(pam):
+                out[b, i, BASE_IDX.get(base.upper(), 4)] = 1.0
+
+        return out
