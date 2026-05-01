@@ -24,3 +24,6 @@ experiments/results/*
 
 # Catboost info
 catboost_info/
+
+# Wandb
+wandb/

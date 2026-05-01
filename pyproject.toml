@@ -25,6 +25,15 @@ dependencies = [
   "wandb>=0.26.1",
 ]
 
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2",
