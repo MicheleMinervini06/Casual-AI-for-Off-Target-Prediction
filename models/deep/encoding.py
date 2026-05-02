@@ -164,48 +164,96 @@ class BiologicalMismatchEncoder(BaseEncoder):
     def __init__(self):
         super().__init__()
         self.embed_dim = 12  # fisso, no parametri
-        # Registra un buffer dummy per tracciare il device quando model.to(device) è chiamato
-        self.register_buffer("_device_tracker", torch.zeros(1))
+        # Precalcola la lookup table mismatch (5x5) e la registra come buffer
+        # in modo che venga spostata automaticamente sulla stessa device del modello.
+        self.register_buffer("mm_table", self._build_mm_table())
+
+    def _build_mm_table(self) -> torch.Tensor:
+        """Costruisce la tabella mismatch 5x5 che mappa coppie di basi a indice mismatch.
+        Le righe/colonne corrispondono a [A,C,G,T,N]."""
+        bases = ["A", "C", "G", "T", "N"]
+        mm_idx = {k: v for k, v in self.MISMATCH_TYPES.items()}
+        table = torch.zeros(5, 5, dtype=torch.long)
+        for i, b1 in enumerate(bases):
+            for j, b2 in enumerate(bases):
+                table[i, j] = mm_idx[classify_mismatch(b1, b2)]
+        return table
 
     def encode(self, sgrnas: list[str], off_targets: list[str]) -> torch.Tensor:
         """
-        Encoding biologicamente motivato dello spacer (20 bp).
-        Restituisce: Tensor[B, 20, 12] con one-hot concatenati.
+        Implementazione vettorizzata dell'encoding dello spacer.
+        Restituisce: Tensor[B, 20, 12] con concatenazione [mm_onehot(4), sg_onehot(4), ot_onehot(4)].
+        Tutte le operazioni sono su tensori PyTorch e sfruttano il buffer `mm_table` per
+        evitare chiamate ripetute a `classify_mismatch` in Python.
         """
+        if len(sgrnas) != len(off_targets):
+            raise ValueError("Le liste sgrnas e off_targets devono avere la stessa lunghezza batch.")
+        if not sgrnas:
+            raise ValueError("Input batch vuoto.")
+
         B = len(sgrnas)
-        device = self._device_tracker.device
-        out = torch.zeros(B, 20, 12, dtype=torch.float32, device=device)
+        device = self.mm_table.device
 
-        for b, (sg, ot) in enumerate(zip(sgrnas, off_targets)):
-            sg = sg[:20].ljust(20, "N")
-            ot = ot[:20].ljust(20, "N")
+        # Mappe per indice: per mm_table usiamo 5 classi (A,C,G,T,N -> 0..4)
+        BASE_IDX_5 = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
+        # Per le one-hot delle basi useremo 4 classi; N viene mappato a 0 (come prima)
+        BASE_IDX_4 = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
 
-            for i, (bg, bt) in enumerate(zip(sg, ot)):
-                mt = classify_mismatch(bg, bt)  # restituisce MismatchType string
+        # Costruzione indici (B, 20) — list comprehension è accettabile qui perché evitiamo
+        # classify_mismatch per ogni coppia: la tabella mm_table è usata dopo.
+        sg_idx_5 = torch.tensor(
+            [[BASE_IDX_5.get(b.upper(), 4) for b in s[:20].ljust(20, "N")] for s in sgrnas],
+            dtype=torch.long,
+            device=device,
+        )
+        ot_idx_5 = torch.tensor(
+            [[BASE_IDX_5.get(b.upper(), 4) for b in t[:20].ljust(20, "N")] for t in off_targets],
+            dtype=torch.long,
+            device=device,
+        )
 
-                # One-hot tipo mismatch (4 dim)
-                out[b, i, self.MISMATCH_TYPES[mt]] = 1.0
-                # One-hot base sgRNA (4 dim)
-                out[b, i, 4 + self.BASE_IDX[bg.upper()]] = 1.0
-                # One-hot base target (4 dim)
-                out[b, i, 8 + self.BASE_IDX[bt.upper()]] = 1.0
+        # mm indices via lookup table: shape (B, 20)
+        mm_idx = self.mm_table[sg_idx_5, ot_idx_5]
 
-        return out
+        # Per le one-hot delle basi creiamo indici a 4 classi (N -> 0)
+        sg_idx_4 = torch.tensor(
+            [[BASE_IDX_4.get(b.upper(), 0) for b in s[:20].ljust(20, "N")] for s in sgrnas],
+            dtype=torch.long,
+            device=device,
+        )
+        ot_idx_4 = torch.tensor(
+            [[BASE_IDX_4.get(b.upper(), 0) for b in t[:20].ljust(20, "N")] for t in off_targets],
+            dtype=torch.long,
+            device=device,
+        )
+
+        mm_oh = F.one_hot(mm_idx, num_classes=4).float()
+        sg_oh = F.one_hot(sg_idx_4, num_classes=4).float()
+        ot_oh = F.one_hot(ot_idx_4, num_classes=4).float()
+
+        encoded = torch.cat([mm_oh, sg_oh, ot_oh], dim=-1)
+        return encoded
 
     def encode_pam(self, off_targets: list[str]) -> torch.Tensor:
         """
-        Encoding PAM (3 bp): 5 classi one-hot (A/C/G/T/N) paddate a embed_dim=12.
-        Restituisce: Tensor[B, 3, 12] per coerenza con lo spacer encoding.
+        Versione vettorizzata dell'encoding PAM.
+        Restituisce: Tensor[B, 3, 12] (prime 5 dim one-hot PAM, padding a 12 dim).
         """
         B = len(off_targets)
-        device = self._device_tracker.device
-        # Crea output (B, 3, 12) — i primi 5 dim sono one-hot, il resto è zero padding
-        out = torch.zeros(B, 3, 12, dtype=torch.float32, device=device)
-        BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
+        device = self.mm_table.device
 
-        for b, ot in enumerate(off_targets):
-            pam = (ot[20:23] if len(ot) >= 23 else "NNN").ljust(3, "N")
-            for i, base in enumerate(pam):
-                out[b, i, BASE_IDX.get(base.upper(), 4)] = 1.0
+        BASE_IDX_5 = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
 
-        return out
+        pam_idx = torch.tensor(
+            [
+                [BASE_IDX_5.get(b.upper(), 4) for b in (ot[20:23] if len(ot) >= 23 else "NNN").ljust(3, "N")[:3]]
+                for ot in off_targets
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+
+        pam_oh5 = F.one_hot(pam_idx, num_classes=5).float()  # (B,3,5)
+        pad = torch.zeros(B, 3, self.embed_dim - 5, device=device)
+        pam_encoded = torch.cat([pam_oh5, pad], dim=-1)
+        return pam_encoded
