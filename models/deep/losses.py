@@ -105,3 +105,42 @@ class NeuralSCMLoss(nn.Module):
             "loss_consist": loss_consist,
             "loss_causal": loss_causal
         }
+    
+class FocalNeuralSCMLoss(NeuralSCMLoss):
+    """
+    Estensione di NeuralSCMLoss che sostituisce la BCE con la Focal Loss.
+    Eredita la logica causale e di consistenza dalla classe base.
+    """
+    def __init__(
+        self,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        lambda_causal: float = 0.01,
+        lambda_consist: float = 0.01,
+    ):
+        # Non registriamo `pos_weight` per la Focal Loss: inizializzazione leggera
+        nn.Module.__init__(self)
+
+        self.alpha = alpha
+        self.gamma = gamma
+        self.lambda_causal = lambda_causal
+        self.lambda_consist = lambda_consist
+
+    def predictive_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Calcola la Focal Loss a partire dalle probabilità `y_pred`.
+        Non utilizza `pos_weight` (contratto senza pesatura delle classi).
+        """
+        eps = 1e-6
+        p = y_pred.clamp(min=eps, max=1.0 - eps)
+
+        # elementwise binary cross entropy
+        ce = F.binary_cross_entropy(p, y_true.float(), reduction="none")
+
+        # probabilità corrette per y_true
+        p_t = p * y_true + (1.0 - p) * (1.0 - y_true)
+        alpha_t = self.alpha * y_true + (1.0 - self.alpha) * (1.0 - y_true)
+
+        focal = alpha_t * ((1.0 - p_t) ** self.gamma) * ce
+
+        return focal.mean()

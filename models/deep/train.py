@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 from torch.utils.data import DataLoader
 
-from .losses import NeuralSCMLoss
+from .losses import NeuralSCMLoss, FocalNeuralSCMLoss
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    loss_fn: NeuralSCMLoss,
+    loss_fn: nn.Module,
     device: torch.device,
     scheduler: Any | None = None,
 ) -> dict[str, float]:
@@ -164,11 +164,26 @@ def train(
     epochs = config.get("epochs", 50)
     patience = config.get("patience", 10)
     
-    loss_fn = NeuralSCMLoss(
-        pos_weight=config.get("pos_weight", 1.0),
-        lambda_causal=config.get("lambda_causal", 0.5),
-        lambda_consist=config.get("lambda_consist", 0.5)
-    ).to(device)
+    # Selettore della funzione di Loss dal Config
+    loss_type = config.get("loss_type", "bce") # Default a focal per questa fase
+
+    if loss_type == "bce":
+        logger.info("Inizializzazione NeuralSCMLoss classica (BCE + pos_weight)")
+        loss_fn = NeuralSCMLoss(
+            pos_weight=config.get("pos_weight", 1.0),
+            lambda_causal=config.get("lambda_causal", 0.5),
+            lambda_consist=config.get("lambda_consist", 0.5)
+        ).to(device)
+    elif loss_type == "focal":
+        logger.info("Inizializzazione FocalNeuralSCMLoss")
+        loss_fn = FocalNeuralSCMLoss(
+            alpha=config.get("focal_alpha", 0.25),
+            gamma=config.get("focal_gamma", 2.0),
+            lambda_causal=config.get("lambda_causal", 0.01),
+            lambda_consist=config.get("lambda_consist", 0.01)
+        ).to(device)
+    else:
+        raise ValueError(f"Tipo di loss sconosciuto: {loss_type}")    
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
