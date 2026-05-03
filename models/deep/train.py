@@ -246,19 +246,40 @@ def train(
                 "system/learning_rate": optimizer.param_groups[0]["lr"]
             })
 
-        # Calcolo dei pesi effettivi per il logging (applichiamo softplus per garantire negatività se usato)
+        # # Calcolo dei pesi effettivi per il logging (applichiamo softplus per garantire negatività se usato)
+        # w_prox_eff = -F.softplus(getattr(model, "w_proximal")).detach().cpu().item()
+        # w_seed_eff = -F.softplus(getattr(model, "w_seed")).detach().cpu().item()
+        # w_nonseed_eff = -F.softplus(getattr(model, "w_nonseed")).detach().cpu().item()
+        # # Applichiamo lo stesso clamp usato nel modello per coerenza visiva
+        # try:
+        #     bias_eff = float(torch.clamp(getattr(model, "bias"), min=-4.0, max=3.0).detach().cpu().item())
+        # except Exception:
+        #     # Fallback: se qualcosa va storto leggiamo il valore grezzo
+        #     bias_eff = float(getattr(model, "bias").detach().cpu().item())
+
+        # logger.info(
+        #     f"  Combiner (Effettivi): w_prox={w_prox_eff:.4f} "
+        #     f"w_seed={w_seed_eff:.4f} w_nonseed={w_nonseed_eff:.4f} bias={bias_eff:.4f}"
+        # )
+
+        # Calcolo dei pesi effettivi per il logging (allineato all'Hard Prior di neural_scm.py)
         w_prox_eff = -F.softplus(getattr(model, "w_proximal")).detach().cpu().item()
-        w_seed_eff = -F.softplus(getattr(model, "w_seed")).detach().cpu().item()
-        w_nonseed_eff = -F.softplus(getattr(model, "w_nonseed")).detach().cpu().item()
-        # Applichiamo lo stesso clamp usato nel modello per coerenza visiva
+        
+        # Leggiamo i parametri base per calcolare la gerarchia
+        w_nonseed_base = F.softplus(getattr(model, "w_nonseed")).detach().cpu().item()
+        w_seed_extra = F.softplus(getattr(model, "w_seed")).detach().cpu().item()
+        
+        # Applichiamo la stessa matematica del forward
+        w_nonseed_eff = -w_nonseed_base
+        w_seed_eff = -(w_nonseed_base + w_seed_extra)
+        
         try:
             bias_eff = float(torch.clamp(getattr(model, "bias"), min=-4.0, max=3.0).detach().cpu().item())
         except Exception:
-            # Fallback: se qualcosa va storto leggiamo il valore grezzo
             bias_eff = float(getattr(model, "bias").detach().cpu().item())
 
         logger.info(
-            f"  Combiner (Effettivi): w_prox={w_prox_eff:.4f} "
+            f"   Combiner (Effettivi): w_prox={w_prox_eff:.4f} "
             f"w_seed={w_seed_eff:.4f} w_nonseed={w_nonseed_eff:.4f} bias={bias_eff:.4f}"
         )
 
@@ -274,5 +295,10 @@ def train(
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
+
+    model_save_path = config.get("output", {}).get("model_pt", "neural_scm.pt")
+
+    if tracker is not None:
+        tracker.log_model_artifact(model_save_path)
 
     return model
