@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoding import PairwiseTokenEncoder, BiologicalMismatchEncoder, BaseEncoder
-from .modules import NonSeedModule, PAMModule, ProximalModule, SeedExtensionModule
+from .modules import NonSeedModule, PAMModule, ProximalModule, SeedExtensionModule, MismatchVectorModule, TypedMismatchModule
 
 
 class NeuralSCM(nn.Module):
@@ -16,21 +16,54 @@ class NeuralSCM(nn.Module):
     Assembla moduli indipendenti in un DAG causale esplicito.
     """
 
-    def __init__(self, embed_dim: int = 16, hidden_dim: int = 32, encoder: BaseEncoder | None = None):
+    def __init__(
+        self, 
+        architecture: str = "mini_mlp", 
+        embed_dim: int = 16, 
+        hidden_dim: int = 4,  # SOLO UNO! Sarà 4 o 32 a seconda di cosa gli passiamo
+        encoder: BaseEncoder | None = None
+    ):
         super().__init__()
-        
-        # Se nessun encoder è fornito, usa PairwiseTokenEncoder di default
+        self.architecture = architecture
+
+        # 1. Inizializzazione Encoder
         if encoder is None:
             encoder = PairwiseTokenEncoder(embed_dim=embed_dim)
         
         self.encoder = encoder
-        self.embed_dim = encoder.embed_dim  # Adatta embed_dim all'encoder
+        self.embed_dim = encoder.embed_dim
 
-        self.pam_node = PAMModule(embed_dim=encoder.embed_dim, hidden_dim=hidden_dim)
-        self.proximal_node = ProximalModule(embed_dim=encoder.embed_dim)
-        self.seed_node = SeedExtensionModule(embed_dim=encoder.embed_dim)
-        self.nonseed_node = NonSeedModule(embed_dim=encoder.embed_dim)
+        # 2. Nodo PAM 
+        self.pam_node = PAMModule(embed_dim=self.embed_dim, hidden_dim=hidden_dim)
 
+        # 3. Inizializzazione ARCHITETTURA-DIPENDENTE
+        if self.architecture == "mini_mlp":
+            # Usa l'UNICO hidden_dim fornito (che in run.py assicureremo essere 4)
+            self.nonseed_node = MismatchVectorModule(region_size=8, hidden_dim=hidden_dim)
+            self.seed_node = MismatchVectorModule(region_size=8, hidden_dim=hidden_dim)
+            self.proximal_node = MismatchVectorModule(region_size=4, hidden_dim=hidden_dim)
+            
+        elif self.architecture == "deep_scm":
+            # Usa l'UNICO hidden_dim fornito (che in run.py assicureremo essere 32)
+            self.proximal_node = ProximalModule(embed_dim=self.embed_dim)
+            self.seed_node = SeedExtensionModule(embed_dim=self.embed_dim)
+            self.nonseed_node = NonSeedModule(embed_dim=self.embed_dim)
+            
+        elif self.architecture == "linear_bypass":
+            self.proximal_node = None
+            self.seed_node = None
+            self.nonseed_node = None
+
+        elif self.architecture == "typed_mlp":
+            # Run 10: MLP basate sul tipo di mismatch (input dimension = region_size * 4)
+            self.nonseed_node = TypedMismatchModule(region_size=8, hidden_dim=hidden_dim)
+            self.seed_node = TypedMismatchModule(region_size=8, hidden_dim=hidden_dim)
+            self.proximal_node = TypedMismatchModule(region_size=4, hidden_dim=hidden_dim)
+            
+        else:
+            raise ValueError(f"Architettura non riconosciuta: {self.architecture}")
+
+        # 4. Parametri del Combiner
         self.w_proximal = nn.Parameter(torch.randn(1))
         self.w_seed = nn.Parameter(torch.randn(1))
         self.w_nonseed = nn.Parameter(torch.randn(1))
@@ -46,72 +79,130 @@ class NeuralSCM(nn.Module):
         if intervention is None:
             intervention = {}
 
-        # Lasciamo l'encoder attivo solo perché ci serve il device e per il PAM
+        # --- 1. PARTE COMUNE: ENCODER E NODO PAM ---
         x_spacer, x_pam = self.encoder(sgrnas, off_targets)
         B = len(sgrnas)
         device = x_spacer.device
 
-        # --- NODO PAM (Lo lasciamo neurale, di solito non overfitta ed è utile per riconoscere NGG) ---
         if "pam_gate" in intervention:
             pam_gate = torch.full((B, 1), intervention["pam_gate"], device=device, dtype=torch.float32)
             _, repr_pam = self.pam_node(x_pam) 
         else:
             pam_gate, repr_pam = self.pam_node(x_pam)
 
-        # =====================================================================
-        # --- BYPASS LINEARE: CONTA MANUALE DEI MISMATCH DALLE STRINGHE ---
-        # =====================================================================
-        s_prox_list, s_seed_list, s_nonseed_list = [], [], []
-        
-        for sg, ot in zip(sgrnas, off_targets):
-            # Confrontiamo nucleotide per nucleotide (1.0 = mismatch, 0.0 = match)
-            # Assumiamo che i primi 20 caratteri siano lo spacer
-            mismatches = [1.0 if sg[i] != ot[i] else 0.0 for i in range(20)]
-            
-            # DEFINIZIONE REGIONI (0-indexed, direzione 5' -> 3')
-            # Allineato a models/deep/modules.py: non-seed 0:8, seed 8:16, proximal 16:20
-            nonseed_mm = sum(mismatches[0:8])    # Pos 1-8 (Non-Seed / distale)
-            seed_mm = sum(mismatches[8:16])      # Pos 9-16 (Seed Extension)
-            prox_mm = sum(mismatches[16:20])     # Pos 17-20 (PAM-proximal)
-            
-            s_nonseed_list.append([nonseed_mm])
-            s_seed_list.append([seed_mm])
-            s_prox_list.append([prox_mm])
-
-        # --- Nodo Proximal (Bypassato) ---
-        if "proximal" in intervention:
-            s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32)
-        else:
-            s_prox = torch.tensor(s_prox_list, dtype=torch.float32, device=device)
-        repr_prox = torch.zeros(B, self.embed_dim, device=device) # Vettore fittizio per non rompere il return
-
-        # --- Nodo Seed (Bypassato) ---
-        if "seed" in intervention:
-            s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32)
-        else:
-            s_seed = torch.tensor(s_seed_list, dtype=torch.float32, device=device)
+        # Inizializziamo le rappresentazioni a zero (servono solo per deep_scm per non rompere il dict)
+        repr_prox = torch.zeros(B, self.embed_dim, device=device)
         repr_seed = torch.zeros(B, self.embed_dim, device=device)
-
-        # --- Nodo Non-Seed (Bypassato) ---
-        if "non_seed" in intervention:
-            s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32)
-        else:
-            s_nonseed = torch.tensor(s_nonseed_list, dtype=torch.float32, device=device)
         repr_nonseed = torch.zeros(B, self.embed_dim, device=device)
+        s_prox = torch.zeros(B, 1, device=device)
+        s_seed = torch.zeros(B, 1, device=device)
+        s_nonseed = torch.zeros(B, 1, device=device)
 
         # =====================================================================
-        # --- FINE BYPASS ---
+        # --- 2. SWITCH ARCHITETTURALE PER I NODI CAUSALI ---
         # =====================================================================
+        
+        if self.architecture == "deep_scm":
+            # Run 7: Reti pesanti sugli embeddings completi
+            assert self.proximal_node is not None and self.seed_node is not None and self.nonseed_node is not None
 
-        # --- NORMALIZZAZIONE BIOLOGICA DELLE RAPPRESENTAZIONI ---
+            if "proximal" in intervention:
+                s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32)
+                _, repr_prox = self.proximal_node(x_spacer)
+            else:
+                s_prox, repr_prox = self.proximal_node(x_spacer)
+
+            if "seed" in intervention:
+                s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32)
+                _, repr_seed = self.seed_node(x_spacer)
+            else:
+                s_seed, repr_seed = self.seed_node(x_spacer)
+
+            if "non_seed" in intervention:
+                s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32)
+                _, repr_nonseed = self.nonseed_node(x_spacer)
+            else:
+                s_nonseed, repr_nonseed = self.nonseed_node(x_spacer)
+
+        elif self.architecture in ["linear_bypass", "mini_mlp"]:
+            # Run 8 & 9: Entrambe usano la conta o il vettore esatto dei mismatch
+            mismatches_batch = []
+            for sg, ot in zip(sgrnas, off_targets):
+                mm = [1.0 if sg[i] != ot[i] else 0.0 for i in range(20)]
+                mismatches_batch.append(mm)
+                
+            # Tensore [B, 20]
+            s_mismatch = torch.tensor(mismatches_batch, dtype=torch.float32, device=device)
+            
+            # Slicing allineato a models/deep/modules.py (0:8, 8:16, 16:20)
+            mm_nonseed = s_mismatch[:, 0:8]
+            mm_seed = s_mismatch[:, 8:16]
+            mm_prox = s_mismatch[:, 16:20]
+
+            if self.architecture == "linear_bypass":
+                # Run 8: Somma bruta
+                s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32) if "proximal" in intervention else mm_prox.sum(dim=1, keepdim=True)
+                s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32) if "seed" in intervention else mm_seed.sum(dim=1, keepdim=True)
+                s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32) if "non_seed" in intervention else mm_nonseed.sum(dim=1, keepdim=True)
+            
+            elif self.architecture == "mini_mlp":
+                # Run 9: Mini-reti non-lineari
+                assert self.proximal_node is not None and self.seed_node is not None and self.nonseed_node is not None
+                s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32) if "proximal" in intervention else self.proximal_node(mm_prox)
+                s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32) if "seed" in intervention else self.seed_node(mm_seed)
+                s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32) if "non_seed" in intervention else self.nonseed_node(mm_nonseed)
+
+        elif self.architecture == "typed_mlp":
+            # Run 10: Estrazione One-Hot (Match, Wobble, Transition, Transversion)
+            typed_batch = []
+            
+            # Helper per la classificazione
+            def get_mismatch_type(sg_char, ot_char):
+                if sg_char == ot_char:
+                    return [1.0, 0.0, 0.0, 0.0] # 0: Match
+                
+                # Wobble (G-T o T-G mima l'RNA G-U)
+                pair = {sg_char, ot_char}
+                if pair == {'G', 'T'}:
+                    return [0.0, 1.0, 0.0, 0.0] # 1: Wobble
+                
+                # Transitions (A<->G, C<->T)
+                if pair in [{'A', 'G'}, {'C', 'T'}]:
+                    return [0.0, 0.0, 1.0, 0.0] # 2: Transition
+                
+                # Tutto il resto è Transversion (Cambiamento della struttura chimica)
+                return [0.0, 0.0, 0.0, 1.0]     # 3: Transversion
+
+            for sg, ot in zip(sgrnas, off_targets):
+                seq_encoding = [get_mismatch_type(sg[i], ot[i]) for i in range(20)]
+                typed_batch.append(seq_encoding)
+                
+            # Tensore [Batch, 20, 4]
+            s_typed = torch.tensor(typed_batch, dtype=torch.float32, device=device)
+            
+            # Slicing
+            mm_nonseed = s_typed[:, 0:8, :]   # [B, 8, 4]
+            mm_seed = s_typed[:, 8:16, :]     # [B, 8, 4]
+            mm_prox = s_typed[:, 16:20, :]    # [B, 4, 4]
+
+            s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32) if "proximal" in intervention else self.proximal_node(mm_prox)
+            s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32) if "seed" in intervention else self.seed_node(mm_seed)
+            s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32) if "non_seed" in intervention else self.nonseed_node(mm_nonseed)
+        
+        else:
+            raise ValueError(f"Architettura non riconosciuta: {self.architecture}")
+
+        # =====================================================================
+        # --- 3. PARTE COMUNE: NORMALIZZAZIONE E HARD PRIOR ---
+        # =====================================================================
         pam_gate = torch.sigmoid(pam_gate)
         
-        # Le ReLU qui ora non faranno nulla (perché la conta è già >= 0), ma le lasciamo per sicurezza
+        # Le ReLU normalizzano output anomali
         s_prox = F.relu(s_prox)
         s_seed = F.relu(s_seed)
         s_nonseed = F.relu(s_nonseed)
 
-        # --- Equazione Strutturale Combinata (HARD PRIOR: SEED DOMINANCE) ---
+        # Hard Prior: Seed Dominance (|w_seed_eff| >= |w_nonseed_eff|)
         w_nonseed_base = F.softplus(self.w_nonseed)
         w_nonseed_eff = -w_nonseed_base
         
@@ -122,107 +213,6 @@ class NeuralSCM(nn.Module):
 
         bias_eff = torch.clamp(self.bias, min=-4.0, max=3.0)
 
-        logit = (s_prox * w_prox_eff) + (s_seed * w_seed_eff) + (s_nonseed * w_nonseed_eff) + bias_eff
-        
-        activity_prob = pam_gate * torch.sigmoid(logit)
-
-        return {
-            "pam_gate": pam_gate,
-            "proximal_scalar": s_prox,
-            "seed_scalar": s_seed,
-            "nonseed_scalar": s_nonseed,
-            "activity_probability": activity_prob,
-            "repr_pam": repr_pam,
-            "repr_proximal": repr_prox,
-            "repr_seed": repr_seed,
-            "repr_nonseed": repr_nonseed
-        }
-        
-        # if intervention is None:
-        #     intervention = {}
-
-        # x_spacer, x_pam = self.encoder(sgrnas, off_targets)
-        # B = len(sgrnas)
-        # device = x_spacer.device
-
-        # # --- Nodo PAM ---
-        # if "pam_gate" in intervention:
-        #     pam_gate = torch.full((B, 1), intervention["pam_gate"], device=device, dtype=torch.float32)
-        #     _, repr_pam = self.pam_node(x_pam) 
-        # else:
-        #     pam_gate, repr_pam = self.pam_node(x_pam)
-
-        # # --- Nodo Proximal ---
-        # if "proximal" in intervention:
-        #     s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32)
-        #     _, repr_prox = self.proximal_node(x_spacer)
-        # else:
-        #     s_prox, repr_prox = self.proximal_node(x_spacer)
-
-        # # --- Nodo Seed Extension ---
-        # if "seed" in intervention:
-        #     s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32)
-        #     _, repr_seed = self.seed_node(x_spacer)
-        # else:
-        #     s_seed, repr_seed = self.seed_node(x_spacer)
-
-        # # --- Nodo Non-Seed ---
-        # if "non_seed" in intervention:
-        #     s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32)
-        #     _, repr_nonseed = self.nonseed_node(x_spacer)
-        # else:
-        #     s_nonseed, repr_nonseed = self.nonseed_node(x_spacer)
-
-        # # --- NORMALIZZAZIONE BIOLOGICA DELLE RAPPRESENTAZIONI ---
-        # # 1. Il PAM Gate DEVE essere una probabilità [0, 1] (AND logico)
-        # pam_gate = torch.sigmoid(pam_gate)
-
-        # # 2. Le penalità energetiche NON POSSONO essere negative. 
-        # # Usiamo ReLU: 0 = sequenza perfetta, >0 = danno da mismatch.
-        # s_prox = F.relu(s_prox)
-        # s_seed = F.relu(s_seed)
-        # s_nonseed = F.relu(s_nonseed)
-
-        # # --- Equazione Strutturale Combinata (HARD CONSTRAINTS TOTALI) ---
-        # # 1. Pesi termodinamici: SOLO penalità (w <= 0)
-        # w_prox_eff = -F.softplus(self.w_proximal)
-        # w_seed_eff = -F.softplus(self.w_seed)
-        # w_nonseed_eff = -F.softplus(self.w_nonseed)
-
-        # # 2. Bias biologico: L'attività basale non può essere < 1% o > 99.3%
-        # # Usiamo clamp sul tensore del parametro per limitarne l'influenza
-        # bias_eff = torch.clamp(self.bias, min=-4.0, max=3.0)
-
-        # # 3. Logit combinato
-        # logit = (s_prox * w_prox_eff) + (s_seed * w_seed_eff) + (s_nonseed * w_nonseed_eff) + bias_eff
-        # activity_prob = pam_gate * torch.sigmoid(logit)
-
-        # --- NORMALIZZAZIONE BIOLOGICA DELLE RAPPRESENTAZIONI ---
-        pam_gate = torch.sigmoid(pam_gate)
-
-        s_prox = F.relu(s_prox)
-        s_seed = F.relu(s_seed)
-        s_nonseed = F.relu(s_nonseed)
-
-        # --- Equazione Strutturale Combinata (HARD PRIOR: SEED DOMINANCE) ---
-        
-        # 1. Il Non-Seed definisce la penalità "base" per i mismatch distali
-        w_nonseed_base = F.softplus(self.w_nonseed)
-        w_nonseed_eff = -w_nonseed_base
-        
-        # 2. Il Seed DEVE essere almeno tanto punitivo quanto il Non-Seed.
-        # w_seed_extra rappresenta quanto il Seed è PIÙ importante del Non-Seed.
-        # Matematicamente: |w_seed_eff| = |w_nonseed_eff| + |w_seed_extra|
-        w_seed_extra = F.softplus(self.w_seed)
-        w_seed_eff = -(w_nonseed_base + w_seed_extra)
-        
-        # 3. Proximal rimane indipendente (solitamente tra Seed e Non-Seed come importanza)
-        w_prox_eff = -F.softplus(self.w_proximal)
-
-        # 4. Bias biologico: clamp per evitare l'esplosione dei logit
-        bias_eff = torch.clamp(self.bias, min=-4.0, max=3.0)
-
-        # 5. Logit combinato: ora la gerarchia è garantita dall'algebra
         logit = (s_prox * w_prox_eff) + (s_seed * w_seed_eff) + (s_nonseed * w_nonseed_eff) + bias_eff
         
         activity_prob = pam_gate * torch.sigmoid(logit)

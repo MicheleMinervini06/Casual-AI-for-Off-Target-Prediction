@@ -220,6 +220,7 @@ def main(config_path: Path) -> None:
     log.info("Using device: %s", device)
 
     model_cfg = cfg.get("model", {})
+    architecture = str(model_cfg.get("architecture", "mini_mlp")).lower()
     
     # Istanzia l'encoder scelto dal config
     encoder_type = str(model_cfg.get("encoder", "pairwise")).lower()
@@ -230,9 +231,19 @@ def main(config_path: Path) -> None:
         encoder = PairwiseTokenEncoder(embed_dim=int(model_cfg.get("embed_dim", 16)))
         log.info("Using PairwiseTokenEncoder (embed_dim=%d)", encoder.embed_dim)
     
+    if architecture == "mini_mlp":
+        node_hidden_dim = int(model_cfg.get("mini_mlp", {}).get("hidden_dim", 4))
+    elif architecture == "typed_mlp":
+        node_hidden_dim = int(model_cfg.get("typed_mlp", {}).get("hidden_dim", 8))    
+    else:
+        node_hidden_dim = int(model_cfg.get("hidden_dim", 32))
+
+    log.info("Using NeuralSCM architecture=%s hidden_dim=%d", architecture, node_hidden_dim)
+
     model = NeuralSCM(
+        architecture=architecture,
         embed_dim=int(model_cfg.get("embed_dim", 16)),
-        hidden_dim=int(model_cfg.get("hidden_dim", 32)),
+        hidden_dim=node_hidden_dim,
         encoder=encoder,
     ).to(device)
 

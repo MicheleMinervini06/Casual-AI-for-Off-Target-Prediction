@@ -36,6 +36,8 @@ def train_epoch(
     total_causal = 0.0
     total_consist = 0.0
     steps = 0
+    all_train_scores = []
+    all_train_labels = []
 
     for batch in loader:
         optimizer.zero_grad()
@@ -48,6 +50,8 @@ def train_epoch(
         # FORWARD 1: Batch Osservazionale
         out_base = model(sgrnas, off_targets)
         y_pred = out_base["activity_probability"].squeeze(-1)
+        all_train_scores.extend(y_pred.detach().cpu().numpy())
+        all_train_labels.extend(labels.detach().cpu().numpy())
 
         out_mut = None
         unaltered_masks = None
@@ -99,11 +103,27 @@ def train_epoch(
         total_causal += loss_dict["loss_causal"].item()
         steps += 1
 
+    y_true = np.array(all_train_labels)
+    y_scores = np.array(all_train_scores)
+    y_pred_binary = (y_scores >= 0.5).astype(int)
+
+    if len(np.unique(y_true)) < 2:
+        train_auprc = 0.0
+        train_auroc = 0.0
+        train_f1 = 0.0
+    else:
+        train_auprc = float(average_precision_score(y_true, y_scores))
+        train_auroc = float(roc_auc_score(y_true, y_scores))
+        train_f1 = float(f1_score(y_true, y_pred_binary))
+
     return {
         "train_loss": total_loss / steps,
         "train_pred_loss": total_pred / steps,
         "train_consist_loss": total_consist / steps,
         "train_causal_loss": total_causal / steps,
+        "train_auprc": train_auprc,
+        "train_auroc": train_auroc,
+        "train_f1": train_f1,
     }
 
 
@@ -229,6 +249,9 @@ def train(
             f"Epoch {epoch+1:03d} | "
             f"Loss: {train_metrics['train_loss']:.4f} "
             f"(P:{train_metrics['train_pred_loss']:.4f} C:{train_metrics['train_causal_loss']:.4f}) | "
+            f"Train AUPRC: {train_metrics['train_auprc']:.4f} | "
+            f"Train AUROC: {train_metrics['train_auroc']:.4f} | "
+            f"Train F1: {train_metrics['train_f1']:.4f} | "
             f"Val AUPRC: {current_auprc:.4f} | Val AUROC: {val_metrics['auroc']:.4f}"
         )
 
@@ -240,6 +263,9 @@ def train(
                 "train/loss_pred": train_metrics.get("train_pred_loss", 0.0),
                 "train/loss_causal": train_metrics.get("train_causal_loss", 0.0),
                 "train/loss_consist": train_metrics.get("train_consist_loss", 0.0),
+                "train/auprc": train_metrics.get("train_auprc", 0.0),
+                "train/auroc": train_metrics.get("train_auroc", 0.0),
+                "train/f1_score": train_metrics.get("train_f1", 0.0),
                 "val/auprc": val_metrics.get("auprc", 0.0),
                 "val/auroc": val_metrics.get("auroc", 0.0),
                 "val/f1_score": val_metrics.get("f1", 0.0),
