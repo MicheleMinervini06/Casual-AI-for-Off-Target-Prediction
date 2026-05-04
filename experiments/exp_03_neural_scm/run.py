@@ -202,18 +202,24 @@ def main(config_path: Path) -> None:
     # 2. Initialise Hardware and NeuralSCM from config
     training_cfg = cfg.get("training", {})
 
-    # Calcolo dinamico di pos_weight dal training set (evita sbilanciamento manuale)
+    # Determina `pos_weight` in modo sicuro.
+    # Se `training.pos_weight_dynamic` è True calcoliamo dinamicamente dal training set,
+    # altrimenti usiamo il valore statico `training.pos_weight` (fallback 1.0).
     try:
-        n_neg = int((df_train["label"] == 0).sum())
-        n_pos = int((df_train["label"] == 1).sum())
-        if n_pos == 0:
-            log.warning("No positive examples in training split; using pos_weight=1.0")
-            training_cfg["pos_weight"] = 1.0
+        if bool(training_cfg.get("pos_weight_dynamic", False)):
+            n_neg = int((df_train["label"] == 0).sum())
+            n_pos = int((df_train["label"] == 1).sum())
+            if n_pos == 0:
+                log.warning("No positive examples in training split; using pos_weight=1.0")
+                training_cfg["pos_weight"] = 1.0
+            else:
+                training_cfg["pos_weight"] = float(n_neg) / float(n_pos)
+                log.info("pos_weight (dynamic): %.1f", training_cfg["pos_weight"])
         else:
-            training_cfg["pos_weight"] = float(n_neg) / float(n_pos)
-            log.info("pos_weight: %.1f", training_cfg["pos_weight"])
+            training_cfg["pos_weight"] = float(training_cfg.get("pos_weight", 1.0))
+            log.info("pos_weight (static from config): %.1f", training_cfg["pos_weight"])
     except Exception as exc:  # fallback sicuro
-        log.warning("Could not compute pos_weight dynamically: %s; defaulting to config or 1.0", exc)
+        log.warning("Could not determine pos_weight: %s; defaulting to config or 1.0", exc)
         training_cfg["pos_weight"] = float(training_cfg.get("pos_weight", 1.0))
 
     device = torch.device(training_cfg.get("device", "cpu"))
@@ -257,7 +263,8 @@ def main(config_path: Path) -> None:
     use_tracking = cfg.get("tracking", {}).get("enabled", False)
     tracker = ExperimentTracker(config=cfg, enabled=use_tracking)
 
-    trained_model = train(model, train_loader, val_loader, training_cfg, tracker=tracker)
+    # Passiamo il config completo a `train()` per coerenza API
+    trained_model = train(model, train_loader, val_loader, cfg, tracker=tracker)
 
     model_path = results_dir / str(cfg.get("output", {}).get("model_pt", "neural_scm.pt"))
     torch.save(trained_model.state_dict(), model_path)

@@ -1,13 +1,19 @@
 _base: experiments/configs/base.yaml
 
 experiment:
-  name: Exp04_LinearBypass_HardPrior
-  tags: ["linear_bypass", "focal_loss", "hard_prior", "ablation"]
-  notes: "Bypassate le MLP per contare esplicitamente i mismatch. Test se le MLP causano l'overfitting."
-
-seed: 42
+  name: Exp07_TypedMLP_IRM
+  tags: ["typed_mlp", "irm", "causal_regularization", "run_11"]
+  notes: "Aggiunta IRMv1 per forzare l'invarianza tra le guide. Warmup di 5 epoche, max lambda 1.0."
 
 model:
+  # scegli tra "linear_bypass", "mini_mlp", o "deep_scm"
+  architecture: "typed_mlp" 
+  
+  # Parametri specifici per la nuova architettura (Run 9)
+  typed_mlp:
+    hidden_dim: 8
+
+  # Parametri base
   embed_dim: 16
   hidden_dim: 32
   encoder: biological_mismatch  # Scegli tra "pairwise" o "biological_mismatch"
@@ -16,14 +22,21 @@ training:
   device: cuda  # Usare 'cpu' solo per debug locale
   learning_rate: 0.0001  # Abbassato per stabilizzare i gradienti con pos_weight alto
   batch_size: 64
-  epochs: 5
+  epochs: 15
   patience: 99 # Disabilita early stopping per garantire un confronto completo
-  pos_weight: 162.0  # Imbalance ratio di CHANGE-seq
+  pos_weight_dynamic: true  # Se true calcola pos_weight dinamicamente dal train split
+  pos_weight: 46.3  # Valore statico di fallback se pos_weight_dynamic == false
   loss_type: focal          # Scegli tra "focal" e "bce"
   focal_alpha: 0.25         # Peso standard per la classe positiva
   focal_gamma: 2.0          # Forza di soppressione per i negativi facili
   lambda_causal: 0.01       # Ridotto per allinearsi alla magnitudo della Focal
   lambda_consist: 0.01      # Ridotto per allinearsi alla magnitudo della Focal
+  pct_start: 0.3
+
+  # Parametri specifici per IRM
+  irm_enabled: true
+  lambda_irm_max: 1.0
+  irm_warmup_epochs: 5
 
 phase3:
   fit_split: train
@@ -50,4 +63,4 @@ output:
   ccs_comparison_json: ccs_comparison.json
 
 tracking:
-  enabled: true  
+  enabled: true

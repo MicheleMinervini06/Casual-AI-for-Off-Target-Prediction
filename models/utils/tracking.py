@@ -57,7 +57,21 @@ class ExperimentTracker:
         """Invia un dizionario di metriche alla dashboard."""
         if self.enabled:
             import wandb
-            wandb.log(metrics, step=step)
+            # Validazione: converti valori numerici e filtra quelli problematici
+            safe_metrics = {}
+            for k, v in metrics.items():
+                try:
+                    if isinstance(v, (int, float)):
+                        safe_metrics[k] = float(v)
+                    elif hasattr(v, "item"):  # torch.Tensor
+                        safe_metrics[k] = float(v.item())
+                    else:
+                        safe_metrics[k] = v
+                except Exception as e:
+                    log.warning(f"Impossibile loggare metrica {k}: {v} ({e})")
+            
+            if safe_metrics:
+                wandb.log(safe_metrics, step=step)
 
     def log_model_artifact(self, model_path: str, artifact_name: str = "neural_scm_weights"):
         """
