@@ -55,7 +55,7 @@ class PairwiseTokenEncoder(BaseEncoder):
         self.vocab_size = len(self.ALPHABET) ** 2  # 5 * 5 = 25
         
         # Mappatura statica (base1, base2) -> intero
-        self._token_map: dict[tuple[str, str], int] = {
+        self._token_map: dict[tuple[str, ...], int] = {
             pair: idx for idx, pair in enumerate(itertools.product(self.ALPHABET, repeat=2))
         }
         self._fallback_token = self._token_map[("N", "N")]
@@ -170,6 +170,11 @@ class BiologicalMismatchEncoder(BaseEncoder):
         # in modo che venga spostata automaticamente sulla stessa device del modello.
         self.register_buffer("mm_table", self._build_mm_table())
 
+    def _device(self) -> torch.device:
+        mm_table = self._buffers["mm_table"]
+        assert mm_table is not None
+        return torch.device(mm_table.device)
+
     def _build_mm_table(self) -> torch.Tensor:
         """Costruisce la tabella mismatch 5x5 che mappa coppie di basi a indice mismatch.
         Le righe/colonne corrispondono a [A,C,G,T,N]."""
@@ -194,7 +199,9 @@ class BiologicalMismatchEncoder(BaseEncoder):
             raise ValueError("Input batch vuoto.")
 
         B = len(sgrnas)
-        device = self.mm_table.device
+        device = self._device()
+        mm_table = self._buffers["mm_table"]
+        assert mm_table is not None
 
         # Mappe per indice: per mm_table usiamo 5 classi (A,C,G,T,N -> 0..4)
         BASE_IDX_5 = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
@@ -215,7 +222,7 @@ class BiologicalMismatchEncoder(BaseEncoder):
         )
 
         # mm indices via lookup table: shape (B, 20)
-        mm_idx = self.mm_table[sg_idx_5, ot_idx_5]
+        mm_idx = mm_table[sg_idx_5, ot_idx_5]
 
         # Per le one-hot delle basi creiamo indici a 4 classi (N -> 0)
         sg_idx_4 = torch.tensor(
@@ -242,7 +249,7 @@ class BiologicalMismatchEncoder(BaseEncoder):
         Restituisce: Tensor[B, 3, 12] (prime 5 dim one-hot PAM, padding a 12 dim).
         """
         B = len(off_targets)
-        device = self.mm_table.device
+        device = self._device()
 
         BASE_IDX_5 = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
 
@@ -258,4 +265,85 @@ class BiologicalMismatchEncoder(BaseEncoder):
         pam_oh5 = F.one_hot(pam_idx, num_classes=5).float()  # (B,3,5)
         pad = torch.zeros(B, 3, self.embed_dim - 5, device=device)
         pam_encoded = torch.cat([pam_oh5, pad], dim=-1)
-        return pam_encoded
+        return pam_encoded 
+
+class ContextAwareMismatchEncoder(BaseEncoder):
+    """
+    Costruisce un vettore 8D per ogni posizione.
+    Versione Vettorizzata
+    """
+    def __init__(self, embed_dim: int = 8):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.register_buffer("_device_anchor", torch.empty(0))
+
+    @property
+    def device(self) -> torch.device:
+        return self._device_anchor.device
+
+    def encode(self, sgrnas: list[str], off_targets: list[str]) -> torch.Tensor:
+        B = len(sgrnas)
+        current_device = self.device
+        
+        # 1. Concatenazione veloce e conversione in byte (ASCII)
+        sg_concat = "".join([s[:20].ljust(20, 'N').upper() for s in sgrnas]).encode('ascii')
+        ot_concat = "".join([t[:20].ljust(20, 'N').upper() for t in off_targets]).encode('ascii')
+        
+        # Trasferimento massivo su GPU come tensore 2D di interi
+        sg_t = torch.frombuffer(bytearray(sg_concat), dtype=torch.uint8).reshape(B, 20).to(current_device, torch.long)
+        ot_t = torch.frombuffer(bytearray(ot_concat), dtype=torch.uint8).reshape(B, 20).to(current_device, torch.long)
+        
+        # Codici ASCII delle basi
+        A, C, G, T = ord('A'), ord('C'), ord('G'), ord('T')
+        
+        # 2. Logica Mismatch Vettorizzata
+        # Partiamo dal default 3 (Transversion)
+        mismatch_tokens = torch.full((B, 20), 3, dtype=torch.long, device=current_device) 
+        
+        mismatch_tokens[sg_t == ot_t] = 0 # Match
+        
+        wobble_mask = ((sg_t == G) & (ot_t == T)) | ((sg_t == T) & (ot_t == G))
+        mismatch_tokens[wobble_mask] = 1 # Wobble
+        
+        transition_mask = ((sg_t == A) & (ot_t == G)) | ((sg_t == G) & (ot_t == A)) | \
+                          ((sg_t == C) & (ot_t == T)) | ((sg_t == T) & (ot_t == C))
+        mismatch_tokens[transition_mask] = 2 # Transition
+        
+        # 3. Logica Contesto Vettorizzata
+        # Partiamo dal default 4 (N o caratteri invalidi)
+        context_tokens = torch.full((B, 20), 4, dtype=torch.long, device=current_device) 
+        context_tokens[sg_t == A] = 0
+        context_tokens[sg_t == C] = 1
+        context_tokens[sg_t == G] = 2
+        context_tokens[sg_t == T] = 3
+
+        # 4. One-Hot ed Esecuzione
+        mm_one_hot = F.one_hot(mismatch_tokens, num_classes=4).float()
+        ctx_one_hot = F.one_hot(context_tokens, num_classes=5).float()[:, :, :4] 
+        
+        return torch.cat([mm_one_hot, ctx_one_hot], dim=-1)
+        
+    def encode_pam(self, off_targets: list[str]) -> torch.Tensor:
+        """Encoding PAM vettorizzato."""
+        B = len(off_targets)
+        current_device = self.device
+
+        pam_concat = "".join([(t[20:23] if len(t) >= 23 else "NNN").ljust(3, "N").upper() for t in off_targets]).encode('ascii')
+        pam_t = torch.frombuffer(bytearray(pam_concat), dtype=torch.uint8).reshape(B, 3).to(current_device, torch.long)
+        
+        A, C, G, T = ord('A'), ord('C'), ord('G'), ord('T')
+        
+        pam_idx = torch.full((B, 3), 4, dtype=torch.long, device=current_device)
+        pam_idx[pam_t == A] = 0
+        pam_idx[pam_t == C] = 1
+        pam_idx[pam_t == G] = 2
+        pam_idx[pam_t == T] = 3
+
+        pam_oh5 = F.one_hot(pam_idx, num_classes=5).float()
+        pad_dim = max(self.embed_dim - 5, 0)
+        
+        if pad_dim > 0:
+            pad = torch.zeros(B, 3, pad_dim, device=current_device)
+            return torch.cat([pam_oh5, pad], dim=-1)
+
+        return pam_oh5[..., :self.embed_dim]
