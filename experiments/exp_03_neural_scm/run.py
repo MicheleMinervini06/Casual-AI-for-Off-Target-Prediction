@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 from evaluation.ccs import calculate_ccs_neural
 from models.deep import NeuralSCM, train
 from models.deep.train import evaluate
-from models.deep.encoding import PairwiseTokenEncoder, BiologicalMismatchEncoder
+from models.deep.encoding import ContextAwareMismatchEncoder, PairwiseTokenEncoder, BiologicalMismatchEncoder
 
 from models.utils.tracking import ExperimentTracker
 
@@ -233,6 +233,9 @@ def main(config_path: Path) -> None:
     if encoder_type == "biological_mismatch":
         encoder = BiologicalMismatchEncoder()
         log.info("Using BiologicalMismatchEncoder (embed_dim=12)")
+    elif encoder_type == "context_aware":  # <-- NUOVO BLOCCO RUN 13
+        encoder = ContextAwareMismatchEncoder(embed_dim=8)
+        log.info("Using ContextAwareMismatchEncoder (embed_dim=8)")
     else:  # default: pairwise
         encoder = PairwiseTokenEncoder(embed_dim=int(model_cfg.get("embed_dim", 16)))
         log.info("Using PairwiseTokenEncoder (embed_dim=%d)", encoder.embed_dim)
@@ -241,6 +244,8 @@ def main(config_path: Path) -> None:
         node_hidden_dim = int(model_cfg.get("mini_mlp", {}).get("hidden_dim", 4))
     elif architecture == "typed_mlp":
         node_hidden_dim = int(model_cfg.get("typed_mlp", {}).get("hidden_dim", 8))    
+    elif architecture == "context_aware_mlp":
+        node_hidden_dim = int(model_cfg.get("context_aware_mlp", {}).get("hidden_dim", 16))
     else:
         node_hidden_dim = int(model_cfg.get("hidden_dim", 32))
 

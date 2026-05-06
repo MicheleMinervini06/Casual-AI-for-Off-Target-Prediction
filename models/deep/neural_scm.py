@@ -70,6 +70,11 @@ class NeuralSCM(nn.Module):
             self.seed_node = TypedMismatchModule(region_size=8, hidden_dim=hidden_dim)
             self.proximal_node = TypedMismatchModule(region_size=4, hidden_dim=hidden_dim)
             
+        elif self.architecture == "context_aware_mlp":
+            self.nonseed_node = TypedMismatchModule(region_size=8, hidden_dim=hidden_dim, input_dim_per_pos=8)
+            self.seed_node = TypedMismatchModule(region_size=8, hidden_dim=hidden_dim, input_dim_per_pos=8)
+            self.proximal_node = TypedMismatchModule(region_size=4, hidden_dim=hidden_dim, input_dim_per_pos=8)
+        
         else:
             raise ValueError(f"Architettura non riconosciuta: {self.architecture}")
 
@@ -213,7 +218,21 @@ class NeuralSCM(nn.Module):
             s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32) if "proximal" in intervention else self.proximal_node(mm_prox)
             s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32) if "seed" in intervention else self.seed_node(mm_seed)
             s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32) if "non_seed" in intervention else self.nonseed_node(mm_nonseed)
-        
+
+        elif self.architecture == "context_aware_mlp":
+            # Run 13: Estrazione Context-Aware (Mismatch + Identità Base sgRNA)
+            # L'encoder restituisce direttamente un tensore [B, 20, 8]
+            s_context = self.encoder.encode(sgrnas, off_targets)
+            
+            # Slicing posizionale (identico alla Run 10, ma l'ultima dimensione è 8)
+            mm_nonseed = s_context[:, 0:8, :]   # [B, 8, 8]
+            mm_seed = s_context[:, 8:16, :]     # [B, 8, 8]
+            mm_prox = s_context[:, 16:20, :]    # [B, 4, 8]
+
+            # Passaggio nei nodi causali (con supporto per gli interventi del Do-Calculus)
+            s_prox = torch.full((B, 1), intervention["proximal"], device=device, dtype=torch.float32) if "proximal" in intervention else self.proximal_node(mm_prox)
+            s_seed = torch.full((B, 1), intervention["seed"], device=device, dtype=torch.float32) if "seed" in intervention else self.seed_node(mm_seed)
+            s_nonseed = torch.full((B, 1), intervention["non_seed"], device=device, dtype=torch.float32) if "non_seed" in intervention else self.nonseed_node(mm_nonseed)
         else:
             raise ValueError(f"Architettura non riconosciuta: {self.architecture}")
 

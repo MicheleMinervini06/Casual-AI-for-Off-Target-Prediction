@@ -127,14 +127,18 @@ class MismatchVectorModule(nn.Module):
 
 class TypedMismatchModule(nn.Module):
     """
-    Riceve il tensore one-hot dei tipi di mismatch (Match, Wobble, Transition, Transversion).
-    Input shape: (Batch, region_size, 4)
+    Riceve il tensore dei feature termodinamici per posizione.
+    Input shape: (Batch, region_size, input_dim_per_pos)
     """
-    def __init__(self, region_size: int, hidden_dim: int = 8):
+    def __init__(self, region_size: int, hidden_dim: int = 8, input_dim_per_pos: int = 4):
         super().__init__()
+        
+        # Calcolo dinamico della dimensione in ingresso
+        in_features = region_size * input_dim_per_pos
+        
         self.fc = nn.Sequential(
-            nn.Flatten(), # Trasforma [B, region_size, 4] in [B, region_size * 4]
-            nn.Linear(region_size * 4, hidden_dim),
+            nn.Flatten(), # Trasforma [B, region_size, dim] in [B, in_features]
+            nn.Linear(in_features, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, 1),
             nn.Softplus(),  # Vincolo biologico morbido (>=0)
