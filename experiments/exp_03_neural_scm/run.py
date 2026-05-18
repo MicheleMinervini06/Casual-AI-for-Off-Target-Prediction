@@ -23,6 +23,7 @@ from models.deep.train import evaluate
 from models.deep.encoding import ContextAwareMismatchEncoder, PairwiseTokenEncoder, BiologicalMismatchEncoder
 
 from models.utils.tracking import ExperimentTracker
+from models.utils.variational_diagnostics import compute_variational_diagnostics
 
 log = logging.getLogger(__name__)
 
@@ -269,12 +270,26 @@ def main(config_path: Path) -> None:
 
     log.info("Using NeuralSCM architecture=%s hidden_dim=%d", architecture, node_hidden_dim)
 
+    # Variational SCM (ELBO training): attivabile da config (model.variational: true)
+    variational = bool(model_cfg.get("variational", False))
+    variational_hidden_dim = int(model_cfg.get("variational_hidden_dim", 32))
+    u_encoder_detach_backbone = bool(model_cfg.get("u_encoder_detach_backbone", True))
+    variational_mc_samples = int(training_cfg.get("variational_mc_samples", 1))
+    if variational:
+        log.info(
+            "Variational SCM ATTIVO (encoder_U hidden_dim=%d, detach_backbone=%s, mc_samples=%d, input=(structural_logit, y))",
+            variational_hidden_dim, u_encoder_detach_backbone, variational_mc_samples,
+        )
+
     model = NeuralSCM(
         architecture=architecture,
         embed_dim=int(model_cfg.get("embed_dim", 16)),
         hidden_dim=node_hidden_dim,
         encoder=encoder,
-        context_dim=context_dim
+        context_dim=context_dim,
+        variational=variational,
+        variational_hidden_dim=variational_hidden_dim,
+        u_encoder_detach_backbone=u_encoder_detach_backbone,
     ).to(device)
 
     # 3. Train and save best model
@@ -296,7 +311,7 @@ def main(config_path: Path) -> None:
 
     # Metriche su train/val/test, usando loader deterministici senza shuffle.
     train_eval_loader = _make_loader(df_train, batch_size, shuffle=False, context_cols=context_cols)
-    train_metrics = evaluate(trained_model, train_eval_loader, device)
+    train_metrics = evaluate(trained_model, train_eval_loader, device, mc_samples=variational_mc_samples)
     log.info("CHANGE-seq train: %s", train_metrics)
     _save_json(
         {"split": "changeseq_train", **_safe_float_dict(train_metrics)},
@@ -304,7 +319,7 @@ def main(config_path: Path) -> None:
     )
 
     val_loader = _make_loader(df_val, batch_size, shuffle=False, context_cols=context_cols)
-    val_metrics = evaluate(trained_model, val_loader, device)
+    val_metrics = evaluate(trained_model, val_loader, device, mc_samples=variational_mc_samples)
     log.info("CHANGE-seq val: %s", val_metrics)
     _save_json(
         {"split": "changeseq_val", **_safe_float_dict(val_metrics)},
@@ -313,7 +328,7 @@ def main(config_path: Path) -> None:
 
     # 4. Evaluate within-dataset (CHANGE-seq test)
     test_loader = _make_loader(df_test, batch_size, shuffle=False, context_cols=context_cols)
-    test_metrics = evaluate(trained_model, test_loader, device)
+    test_metrics = evaluate(trained_model, test_loader, device, mc_samples=variational_mc_samples)
     log.info("CHANGE-seq test: %s", test_metrics)
     _save_json(
         {"split": "changeseq_test", **_safe_float_dict(test_metrics)},
@@ -328,7 +343,7 @@ def main(config_path: Path) -> None:
     if guideseq_path.exists():
         df_guide = pd.read_parquet(guideseq_path)
         guide_loader = _make_loader(df_guide, batch_size, shuffle=False, context_cols=context_cols)
-        guide_metrics = evaluate(trained_model, guide_loader, device)
+        guide_metrics = evaluate(trained_model, guide_loader, device, mc_samples=variational_mc_samples)
         log.info("GUIDE-seq cross-assay: %s", guide_metrics)
         _save_json(
             {"split": "guideseq", **_safe_float_dict(guide_metrics)},
@@ -339,6 +354,26 @@ def main(config_path: Path) -> None:
     else:
         log.warning("GUIDE-seq features not found at %s; skipping cross-assay", guideseq_path)
         _save_json({"status": "skipped", "reason": f"not found: {guideseq_path}"}, out_guideseq)
+
+    # 5b. Variational diagnostics (solo se model.variational == True)
+    if getattr(trained_model, "variational", False):
+        log.info("Calcolo diagnostica variational su val split...")
+        diag_val_loader = _make_loader(df_val, batch_size, shuffle=False, context_cols=context_cols)
+        diag = compute_variational_diagnostics(trained_model, diag_val_loader, device)
+        verdict_label = diag.get("verdict", {}).get("label", "n/a")
+        mean_kl = diag.get("verdict", {}).get("mean_kl", float("nan"))
+        mean_sens = diag.get("verdict", {}).get("mean_decoder_sensitivity", float("nan"))
+        log.info(
+            "Variational diagnostics: verdict=%s | mean_KL=%.6f | mean_decoder_sensitivity=%.6f",
+            verdict_label, mean_kl, mean_sens,
+        )
+        _save_json(diag, results_dir / "variational_diagnostics_val.json")
+        if tracker is not None:
+            tracker.log_metrics({
+                "variational/verdict": verdict_label,
+                "variational/mean_kl": mean_kl,
+                "variational/mean_decoder_sensitivity": mean_sens,
+            })
 
     # 6. CCS with native do() — compare with XGBoost baseline
     ccs_cfg = cfg.get("ccs", {})

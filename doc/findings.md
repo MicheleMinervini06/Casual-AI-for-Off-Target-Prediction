@@ -384,3 +384,132 @@ Differenza ~6 punti percentuali: una guida con 543 righe pesa 543× nella media 
 - [ ] Stratificare `U_off` su CHANGEseq per GC%, regione genomica accessibile, distanza al PAM canonico per testare l'ipotesi "U_off = saturazione cell-free" (F9).
 - [ ] Aggiungere bootstrap CI sulle medie per-guida dei `Δ` per quantificare la significatività statistica delle conclusioni F10.
 - [ ] Confrontare interventi fissi vs rescue guida-specifica sulla stessa popolazione per validare il ragionamento controfattuale del modello.
+
+---
+
+## Fase 5 — Estensione variazionale: modellazione esplicita di U con ELBO
+
+### Motivazione
+
+Nel framework di Pearl ogni nodo del DAG riceve un termine esogeno `U_i` che cattura tutto ciò che il modello strutturale non spiega. Fino a Run 15, U non era modellato esplicitamente: il backbone calcolava `P(Y|X)` con `U=0` (media del prior), che è teoricamente corretto per la predizione osservazionale ma non fornisce una distribuzione posteriore `q(U|X, Y_obs)` per l'abduction individuale.
+
+L'obiettivo era introdurre un encoder `q(U|X, Y)` addestrato con l'ELBO (Evidence Lower Bound):
+
+```
+ELBO = E_q[log p(Y | X, U)] − KL[q(U|X,Y) || p(U)]
+```
+
+con `p(U) = N(0,1)` e U iniettato additivamente nel logit finale (`logit_cf = struct_logit + U`). Il termine KL regolarizza l'encoder verso il prior, prevenendo che U diventi un semplice lookup della label.
+
+---
+
+### F12 — Run 16 (β=1.0): KL collapse — encoder rate-limited dall'information bottleneck
+
+**Setup:** encoder `q(U|X,Y)` con input 2-dim `(structural_logit, y)`, β=1.0, warmup KL 5 epoche.
+
+**Nota architetturale:** la prima versione dell'encoder usava 81 feature come input (80 feature di sequenza + 1 label). Il problema era che le feature di sequenza dominavano il singolo bit di label, impedendo all'encoder di imparare l'abduction del residuo. Fix: ridotto l'input a 2 dimensioni `(structural_logit, y)`, forzando l'MLP a modellare la discrepanza tra predizione strutturale e osservazione — semanticamente equivalente al residuo di abduction di Pearl.
+
+**Diagnostica (val split, 842k campioni):**
+
+| Metrica | Valore | Interpretazione |
+|---|---|---|
+| mean KL | 6.8×10⁻⁵ | quasi zero → collapse |
+| μ_U std | 0.011 | encoder produce μ ≈ 0 per quasi tutti gli esempi |
+| pearson(μ, label) | 0.81 | encoder direzionalmente corretto |
+| decoder_sensitivity | 3.4×10⁻⁴ | backbone quasi ignora U |
+| verdict | full_collapse | — |
+
+**Spiegazione teorica:** si può dimostrare (Higgins et al., β-VAE, 2017; Alemi et al., 2018) che:
+
+```
+I(U ; Y | X)  ≤  KL[ q(U|X,Y) || p(U) ]
+```
+
+La mutua informazione tra U e Y dato X è limitata superiormente dalla KL. Con β=1.0 la penalità KL sopprime qualunque deviazione dal prior → l'encoder non riesce ad amplificare il segnale già appreso direzionalmente. Non è un collapse per assenza di segnale, ma un collapse per pressione eccessiva del regolarizzatore.
+
+**Risultati predittivi:**
+
+| Split | AUPRC | AUROC |
+|---|---|---|
+| CHANGE-seq test | 0.139 | 0.896 |
+| GUIDE-seq cross-assay | 0.209 | 0.950 |
+
+Leggermente inferiore a Run 15 (0.154 / 0.285): il KL aggiunge rumore al training senza portare beneficio perché U ≈ 0 sempre.
+
+---
+
+### F13 — Run 17 (β=0.1, β-VAE): label leakage — backbone lazy
+
+**Setup:** identico a Run 16 con `beta_kl_max = 0.1` (ridotto di 10×). Logica: abbassare β rilascia il bottleneck di ampiezza permettendo all'encoder di amplificare il segnale già direzionalmente corretto.
+
+**Diagnostica (val split):**
+
+| Metrica | Run 16 (β=1.0) | Run 17 (β=0.1) | Trend |
+|---|---|---|---|
+| mean KL | 6.8×10⁻⁵ | 4.0×10⁻³ | ×60 ↑ |
+| μ_U std | 0.011 | 0.081 | ×8 ↑ |
+| pearson(μ, label) | 0.81 | 0.85 | stabile ↑ |
+| decoder_sensitivity | 3.4×10⁻⁴ | 2.6×10⁻³ | ×8 ↑ |
+
+L'encoder è diventato attivo. Ma i risultati predittivi sono crollati:
+
+| Split | Run 15 (ref) | Run 17 | Delta |
+|---|---|---|---|
+| CHANGE-seq test AUPRC | 0.154 | 0.044 | −71% |
+| GUIDE-seq AUPRC | 0.285 | 0.021 | −93% |
+
+**Diagnosi — Label leakage con lazy backbone:**
+
+Con β=0.1 il training minimizza `Focal(struct + U_sample, Y)` dove `U_sample = μ + σε` e `μ = encoder(struct_logit, Y)`. L'encoder ha accesso diretto a `Y` → apprende `μ ≈ f(Y)`. Il gradiente della loss fluisce principalmente attraverso U, quindi il backbone apprende a fare poco e delegare a U:
+
+```
+training:   U = encoder(struct_logit, Y)  → informativo → backbone lazy
+inferenza:  U = 0  (Y non disponibile)    → backbone debole → crash
+```
+
+Questa è una tensione strutturale del CVAE end-to-end: l'encoder è un "shortcut" che impedisce al backbone di imparare il meccanismo strutturale.
+
+---
+
+### F14 — Fix A (MC marginalization): non risolve il lazy backbone
+
+**Fix proposto:** all'inferenza, invece di `U=0`, calcolare `p(Y|X) = E_{U~N(0,1)}[p(Y|X,U)]` con K=16 campioni dal prior.
+
+**Risultato:**
+
+| Split | Run 17 (U=0) | Run 17 + Fix A (MC, K=16) |
+|---|---|---|
+| CHANGE-seq test AUPRC | 0.044 | 0.0435 |
+| GUIDE-seq AUPRC | 0.021 | 0.021 |
+
+Nessun miglioramento. La MC marginalization funziona solo se il backbone è già predittivo: `E[σ(struct + U)] ≈ σ(struct / √(1 + πσ²/8))` — se `struct ≈ 0` (backbone lazy), l'attesa rimane ≈ 0.5 per ogni esempio e la discriminazione è nulla.
+
+---
+
+### F15 — Conclusione: l'abduction algebrica post-hoc è la soluzione corretta e già implementata
+
+**Analisi teorica:** nella teoria classica di Pearl, U non viene mai ottimizzato congiuntamente al modello strutturale. Le equazioni strutturali `f_i` vengono apprese prima (dalla distribuzione osservazionale o interventionale), dopodiché U viene inferito come residuo:
+
+```
+U* = logit(Y_obs) − struct_logit(X)   ← abduction algebrica (forma chiusa)
+Y_cf = σ(struct_logit(X_cf) + U*)     ← controfattuale individuale
+```
+
+Questa forma è identica a ciò che `simulate_intervention.py` e `simulate_intervention_batch.py` già implementano sul backbone di Run 15, senza alcun training aggiuntivo.
+
+**Perché l'end-to-end ELBO è inferiore per questo problema:**
+
+1. Per la predizione osservazionale `P(Y|X)`: U si marginalizza sul prior → equivalente a `U=0` → backbone puro è sufficiente e corretto (Run 15)
+2. Per i controfattuali individuali: serve `U* = abduction(Y_obs)` → la forma algebrica è più fedele a Pearl, più semplice, e non introduce il lazy backbone problem
+3. Il CVAE end-to-end avrebbe senso solo se il backbone fosse vincolato a restare predittivo anche con `U=0` (backbone supervision) — ma questo richiederebbe un training a due fasi, riproducendo esattamente la separazione teorica di Pearl
+
+**Configurazione finale adottata:**
+
+| Componente | Implementazione | Note |
+|---|---|---|
+| Modello predittivo `P(Y\|X)` | Run 15 backbone (positional MLP, no U) | Pearl-consistent per predizione osservazionale |
+| CCS — effetti causali medi | `model.do()` su nodi DAG | nessun U necessario per ATE |
+| Abduction individuale `U*` | `U* = logit(y_obs) − struct_logit(x)` | algebraica, post-hoc, zero overhead di training |
+| Controfattuale individuale | `σ(struct_logit(x_cf) + U*)` | già operativo in `simulate_intervention_batch.py` |
+
+**Nota sulla pam_gate:** l'abduction algebrica ignora il fattore moltiplicativo `pam_gate` (`activity_prob = pam_gate × σ(logit)`). La forma esatta non è risolvibile in forma chiusa con pam_gate. Per off-target con PAM canonico (NGG, `pam_gate ≈ 1`) l'approssimazione è trascurabile; per PAM non canonici introduce un bias sistematico. Documentato come limitazione.

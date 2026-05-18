@@ -1,9 +1,9 @@
 _base: experiments/configs/base.yaml
 
 experiment:
-  name: Exp15_Positional_ExtendedOneCycle
-  tags: ["hybrid_causal", "positional_mlp", "run_15", "extended_training"]
-  notes: "Ritorno allo scheduler OneCycleLR per evitare lo shock dei gradienti. Epoche raddoppiate (30) e pct_start dimezzato (0.15) per mantenere il warmup identico alla Run 13 ma estendere drasticamente la fase di fine-tuning a basso LR."
+  name: Exp17_Variational_BetaVAE
+  tags: ["hybrid_causal", "positional_mlp", "run_17", "variational", "beta_vae", "abduction-residual"]
+  notes: "Run 17: stesso setup di Run 16 (encoder_U 2-dim su (structural_logit, y), detach=True), ma con beta_kl_max=0.1 (β-VAE). La diagnostica di Run 16 ha mostrato encoder DIREZIONALMENTE corretto (pearson(μ,label)=0.81) ma rate-limited dal KL (mean_KL≈7e-5, μ amplitude std≈0.01). Riducendo β di 10× rilasciamo il bottleneck di amplitude lasciando l'encoder libero di amplificare il segnale già appreso. Target: mean_KL ~0.01-0.1, decoder_sensitivity > 1e-2, correlazioni invariate."
 model:
   # scegli tra "linear_bypass", "mini_mlp", o "deep_scm"
   architecture: "positional_mlp"
@@ -18,6 +18,12 @@ model:
     - gc_offtarget
     - concept_gc_delta
 
+  # --- Variational SCM (Run 16) ---
+  variational: true
+  variational_hidden_dim: 32        # Larghezza dell'inference network q(U|x,y)
+  u_encoder_detach_backbone: true   # True: la KL non re-tira il backbone (Pearl-orthodox).
+                                    # False: gradiente fully end-to-end (più rumoroso).
+
 training:
   device: cuda  # Usare 'cpu' solo per debug locale
   learning_rate: 0.0001  # Abbassato per stabilizzare i gradienti con pos_weight alto
@@ -26,12 +32,17 @@ training:
   patience: 99 # Disabilita early stopping per garantire un confronto completo
   pos_weight_dynamic: false  # Se true calcola pos_weight dinamicamente dal train split
   pos_weight: 5.0  # Valore statico di fallback se pos_weight_dynamic == false
-  loss_type: focal          # Scegli tra "focal" e "bce"
+  loss_type: focal          # Per modelli variational viene comunque forzata la Variational(Focal+KL)
   focal_alpha: 0.25         # Peso standard per la classe positiva
   focal_gamma: 3.0          # Forza di soppressione per i negativi facili
   lambda_causal: 0.01       # Ridotto per allinearsi alla magnitudo della Focal
   lambda_consist: 0.01      # Ridotto per allinearsi alla magnitudo della Focal
   pct_start: 0.15
+
+  # --- Variational: parametri ELBO ---
+  beta_kl_max: 0.1          # β-VAE: ridotto da 1.0 (Run 16) per rilasciare bottleneck amplitude
+  kl_warmup_epochs: 5       # Linear warmup di beta da 0 a beta_kl_max
+  variational_mc_samples: 16  # Fix A: MC marginalization p(y|x)=E_{U~N(0,1)}[p(y|x,U)] all'inferenza
 
   # Parametri specifici per IRM
   irm_enabled: false
