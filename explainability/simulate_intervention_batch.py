@@ -1,6 +1,8 @@
 """Batch counterfactual analysis: applica interventi a tutte le coppie
 (guide, off-target) di un dataset e produce CSV + plot Pareto + distribuzioni di U.
 
+Default model: Exp18_Positional_AdditivePAM (pam_mode=additive, encoding 4-dim).
+
 Interventi implementati:
   1) truncate_5p          (sequence-level):  guide → "NN" + guide[2:]
   2) do(pos_14=0)         (DAG node-level):  forza penalità a 0 sul nodo P_14
@@ -11,25 +13,26 @@ Interventi implementati:
        Treatment: guide[8:16] = "ATATATAT"  (perfect period-2 repeat)
        Control:   guide[8:16] = "AAAATTTT"  (stessa composizione, no period-2)
 
-NOTA EPISTEMICA su 3 e 4:
-  Il modello positional_mlp processa ogni posizione in modo indipendente — non
-  può rappresentare diversità (joint property) o ripetizione (cross-position
-  property). Le predizioni risponderanno solo via la somma dei singoli effetti
-  posizionali. Implementiamo questi interventi comunque come baseline metodologico
-  e per dimostrare empiricamente la limitazione architetturale.
+Modalità PAM (selezionabile via --pam-mode, default "additive" per Exp18):
 
-Abduzione pam_gate-aware (Pearl-compliant):
-  Il modello è  y = pam_gate * σ(struct_logit + U)
-  quindi      U = logit(y_obs / pam_gate) - struct_logit
-  con clipping a (eps, 1-eps) per stabilità quando y_obs ≥ pam_gate.
+  Multiplicative (Run 15 e precedenti):  activity = pam_gate * σ(struct_logit + U)
+    Abduction:  U = logit(y_obs / pam_gate) - struct_logit   (con clipping per y_obs > pam_gate)
+    CF:         y_cf = pam_gate_cf * σ(struct_logit_cf + U)
 
-Controfattuale individuale:
-  y_cf = pam_gate_cf * σ(struct_logit_cf + U)
-  con pam_gate_cf e struct_logit_cf dal forward post-intervento.
+  Additive (Run 18+, fix F17 della saturazione pam_gate):
+                                          activity = σ(struct_logit + pam_logit + U)
+                                          (NB: out["logit"] include già pam_logit)
+    Abduction:  U = logit(y_obs) - out["logit"]              (nessun clipping artifact)
+    CF:         y_cf = σ(out_cf["logit"] + U)
+
+NOTA EPISTEMICA sui 4 interventi:
+  L'architettura positional_mlp processa ogni posizione in modo indipendente
+  (kernel=1). Non può rappresentare diversità (joint property) o ripetizione
+  (cross-position property). Gli interventi diversity/repeat sono inclusi come
+  baseline diagnostico per evidenziare empiricamente questa limitazione.
 
 Contrasto Treatment-Control (per interventi 3 e 4):
-  delta_TC = y_cf_T - y_cf_C
-  Effetto "puro" dell'intervento isolato dal contesto della coppia.
+  delta_TC = y_cf_T - y_cf_C  → effetto "puro" dell'intervento isolato.
 """
 from __future__ import annotations
 
@@ -80,21 +83,32 @@ def compute_gc_context_batch(guides: list[str], targets: list[str], device: torc
     return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
-# ---------- abduzione e controfattuale (pam_gate-aware) ----------
+# ---------- abduzione e controfattuale (mode-aware) ----------
 
 def abduct_U(
     y_obs_prob_pct: np.ndarray,
     struct_logit: np.ndarray,
     pam_gate: np.ndarray,
+    pam_mode: str = "additive",
 ) -> np.ndarray:
     """
-    Abduzione Pearl-corretta: U = logit(y_obs / pam_gate) - struct_logit.
+    Abduzione Pearl-corretta, formula dipendente da pam_mode.
 
-    Inversione algebrica del modello  y_obs = pam_gate * σ(struct_logit + U).
-    Clipping a (EPS, 1-EPS) gestisce i casi y_obs ≥ pam_gate (incoerenza
-    tra osservazione e previsione PAM del modello — raro per NGG canonico).
+    additive (Run 18+):  U = logit(y_obs) - struct_logit
+        Il modello è activity = σ(struct_logit + U), con struct_logit
+        che già include il contributo PAM (out["logit"] dal forward).
+        Nessun clipping artifact: y_obs ∈ (0, 1) sempre.
+
+    multiplicative (Run 15):  U = logit(y_obs / pam_gate) - struct_logit
+        Il modello è activity = pam_gate * σ(struct_logit + U).
+        Richiede clipping a (EPS, 1-EPS) per gestire y_obs ≥ pam_gate.
     """
-    p_unit = np.clip(y_obs_prob_pct / 100.0 / pam_gate, EPS, 1.0 - EPS)
+    if pam_mode == "additive":
+        p_unit = np.clip(y_obs_prob_pct / 100.0, EPS, 1.0 - EPS)
+    elif pam_mode == "multiplicative":
+        p_unit = np.clip(y_obs_prob_pct / 100.0 / pam_gate, EPS, 1.0 - EPS)
+    else:
+        raise ValueError(f"pam_mode non riconosciuto: {pam_mode}")
     return np.log(p_unit / (1.0 - p_unit)) - struct_logit
 
 
@@ -102,9 +116,20 @@ def counterfactual_prob_pct(
     struct_logit_cf: np.ndarray,
     pam_gate_cf: np.ndarray,
     U: np.ndarray,
+    pam_mode: str = "additive",
 ) -> np.ndarray:
-    """y_cf (in %) = pam_gate_cf * σ(struct_logit_cf + U) * 100."""
-    return pam_gate_cf * sigmoid(struct_logit_cf + U) * 100.0
+    """y_cf (in %) — formula dipendente da pam_mode.
+
+    additive:        y_cf = σ(struct_logit_cf + U) * 100
+                     (struct_logit_cf include già pam_logit_contrib)
+    multiplicative:  y_cf = pam_gate_cf * σ(struct_logit_cf + U) * 100
+    """
+    if pam_mode == "additive":
+        return sigmoid(struct_logit_cf + U) * 100.0
+    elif pam_mode == "multiplicative":
+        return pam_gate_cf * sigmoid(struct_logit_cf + U) * 100.0
+    else:
+        raise ValueError(f"pam_mode non riconosciuto: {pam_mode}")
 
 
 # ---------- forward batched ----------
@@ -118,11 +143,16 @@ def model_forward_batched(
     intervention: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Forward batched. Restituisce (struct_logit, pam_gate_post_sigmoid).
+    Forward batched. Restituisce (struct_logit, pam_gate).
 
-    Se `intervention` è fornito, applica `model.do(intervention)` — Pearl
-    do-calculus sui nodi DAG. Per positional_mlp sono supportati:
-      - intervention["pam_gate"] = <valore pre-sigmoid>
+    NOTA: il significato di entrambi i valori dipende da model.pam_mode:
+      - multiplicative: struct_logit = thermo + context (+ u_term); pam_gate ∈ (0,1)
+        moltiplicativo, attività = pam_gate * σ(struct_logit + U)
+      - additive: struct_logit = thermo + context + pam_logit (+ u_term);
+        pam_gate = σ(pam_logit_contrib) diagnostico, non usato nel calcolo CF
+
+    Se `intervention` è fornito, applica `model.do(intervention)`. Per positional_mlp:
+      - intervention["pam_gate"] = <pre-sigmoid logit value, mult> o <pam_logit_contrib, additive>
       - intervention["pos_<i>"]  = <penalty value>, i in 0..19
     """
     n = len(guides)
@@ -176,7 +206,14 @@ def main():
     parser.add_argument("--dataset", choices=["changeseq", "guideseq"], default="guideseq")
     parser.add_argument(
         "--model_path",
-        default="experiments/results/Exp15_Positional_ExtendedOneCycle/neural_scm.pt",
+        default="experiments/results/Exp18_Positional_AdditivePAM/neural_scm.pt",
+        help="Default: Exp18_Positional_AdditivePAM (additive mode, current best model).",
+    )
+    parser.add_argument(
+        "--pam-mode",
+        choices=["additive", "multiplicative"],
+        default="additive",
+        help="Modalità PAM del modello caricato. Default 'additive' per Exp18+.",
     )
     parser.add_argument("--output_dir", default="explainability/batch_results")
     parser.add_argument("--batch_size", type=int, default=512)
@@ -190,7 +227,9 @@ def main():
 
     if args.on_target_mode is None:
         args.on_target_mode = "per_run" if args.dataset == "guideseq" else "drop"
-    print(f"On-target mode: {args.on_target_mode}")
+    print(f"PAM mode:        {args.pam_mode}")
+    print(f"On-target mode:  {args.on_target_mode}")
+    print(f"Model:           {args.model_path}")
 
     if args.dataset == "changeseq":
         csv_path = "data/raw/changeseq/CHANGEseq_positive.csv"
@@ -217,10 +256,11 @@ def main():
         architecture="positional_mlp",
         hidden_dim=8,
         context_dim=context_dim,
+        pam_mode=args.pam_mode,
     )
     model.load_state_dict(state_dict)
     model.to(device).eval()
-    print(f"Modello caricato (context_dim={context_dim})")
+    print(f"Modello caricato (context_dim={context_dim}, pam_mode={args.pam_mode})")
 
     # 2. Dataset
     df = pd.read_csv(csv_path)
@@ -291,7 +331,7 @@ def main():
 
     # Helper locale per ridurre boilerplate
     def fwd_pair(guides: list[str], intervention: dict | None = None):
-        """Esegue forward su (guides, off_targets) e (guides, on_targets). Restituisce
+        """Forward su (guides, off_targets) e (guides, on_targets). Restituisce
         ((logit_off, pam_off), (logit_on, pam_on))."""
         ctx_off = compute_gc_context_batch(guides, off_targets, device)
         ctx_on = compute_gc_context_batch(guides, on_targets, device)
@@ -321,56 +361,78 @@ def main():
     (logit_off_repT, pam_off_repT), (logit_on_repT, pam_on_repT) = fwd_pair(guides_repT)
     (logit_off_repC, pam_off_repC), (logit_on_repC, pam_on_repC) = fwd_pair(guides_repC)
 
-    # 8. Predizioni factual (con pam_gate: y_pred = pam_gate * σ(logit), coerente col modello)
+    # 8. Predizioni factual — coerenti col modello in base alla modalità
     off_df["pam_off_f"] = pam_off_f
     off_df["pam_on_f"] = pam_on_f
-    off_df["y_pred_off_prob"] = pam_off_f * sigmoid(logit_off_f) * 100.0
-    off_df["y_pred_on_prob"] = pam_on_f * sigmoid(logit_on_f) * 100.0
+    if args.pam_mode == "additive":
+        # In additive: activity = σ(logit). pam_gate è solo diagnostico.
+        off_df["y_pred_off_prob"] = sigmoid(logit_off_f) * 100.0
+        off_df["y_pred_on_prob"] = sigmoid(logit_on_f) * 100.0
+    else:
+        # In multiplicative: activity = pam_gate × σ(logit)
+        off_df["y_pred_off_prob"] = pam_off_f * sigmoid(logit_off_f) * 100.0
+        off_df["y_pred_on_prob"] = pam_on_f * sigmoid(logit_on_f) * 100.0
 
-    # 9. Abduzione off-target (pam_gate-aware)
-    off_df["U_off"] = abduct_U(np.asarray(off_df["y_obs_off_prob"].values), logit_off_f, pam_off_f)
+    # 9. Abduzione off-target (mode-aware)
+    off_df["U_off"] = abduct_U(
+        np.asarray(off_df["y_obs_off_prob"].values),
+        logit_off_f,
+        pam_off_f,
+        pam_mode=args.pam_mode,
+    )
     U_off_arr = np.asarray(off_df["U_off"].values)
 
-    # 10. Controfattuali off-target (pam_gate_cf-aware)
-    off_df["y_cf_off_tru_prob"] = counterfactual_prob_pct(logit_off_t, pam_off_t, U_off_arr)
-    off_df["y_cf_off_p14_prob"] = counterfactual_prob_pct(logit_off_p14, pam_off_p14, U_off_arr)
-    off_df["y_cf_off_divT_prob"] = counterfactual_prob_pct(logit_off_divT, pam_off_divT, U_off_arr)
-    off_df["y_cf_off_divC_prob"] = counterfactual_prob_pct(logit_off_divC, pam_off_divC, U_off_arr)
-    off_df["y_cf_off_repT_prob"] = counterfactual_prob_pct(logit_off_repT, pam_off_repT, U_off_arr)
-    off_df["y_cf_off_repC_prob"] = counterfactual_prob_pct(logit_off_repC, pam_off_repC, U_off_arr)
+    # 10. Controfattuali off-target (mode-aware)
+    cf = lambda l, p: counterfactual_prob_pct(l, p, U_off_arr, pam_mode=args.pam_mode)
+    off_df["y_cf_off_tru_prob"] = cf(logit_off_t, pam_off_t)
+    off_df["y_cf_off_p14_prob"] = cf(logit_off_p14, pam_off_p14)
+    off_df["y_cf_off_divT_prob"] = cf(logit_off_divT, pam_off_divT)
+    off_df["y_cf_off_divC_prob"] = cf(logit_off_divC, pam_off_divC)
+    off_df["y_cf_off_repT_prob"] = cf(logit_off_repT, pam_off_repT)
+    off_df["y_cf_off_repC_prob"] = cf(logit_off_repC, pam_off_repC)
 
-    # Delta vs y_obs (baseline) per interventi single-condition
     off_df["delta_off_tru"] = off_df["y_cf_off_tru_prob"] - off_df["y_obs_off_prob"]
     off_df["delta_off_p14"] = off_df["y_cf_off_p14_prob"] - off_df["y_obs_off_prob"]
-    # Delta vs y_obs per T e C separati (utile per stratificare)
     off_df["delta_off_divT"] = off_df["y_cf_off_divT_prob"] - off_df["y_obs_off_prob"]
     off_df["delta_off_divC"] = off_df["y_cf_off_divC_prob"] - off_df["y_obs_off_prob"]
     off_df["delta_off_repT"] = off_df["y_cf_off_repT_prob"] - off_df["y_obs_off_prob"]
     off_df["delta_off_repC"] = off_df["y_cf_off_repC_prob"] - off_df["y_obs_off_prob"]
-    # Contrasto Treatment-Control: l'effetto "puro" dell'intervento
     off_df["delta_off_divTC"] = off_df["y_cf_off_divT_prob"] - off_df["y_cf_off_divC_prob"]
     off_df["delta_off_repTC"] = off_df["y_cf_off_repT_prob"] - off_df["y_cf_off_repC_prob"]
 
     # 11. On-target: due regimi distinti
+    def model_pred_pct(logit, pam):
+        """Predizione del modello in % (mode-aware)."""
+        if args.pam_mode == "additive":
+            return sigmoid(logit) * 100.0
+        return pam * sigmoid(logit) * 100.0
+
     if args.on_target_mode == "drop":
         # Nessuna abduzione on-target. Baseline = y_pred_on. CF = pure model output.
         off_df["U_on"] = np.nan
-        off_df["y_cf_on_tru_prob"] = pam_on_t * sigmoid(logit_on_t) * 100.0
-        off_df["y_cf_on_p14_prob"] = pam_on_p14 * sigmoid(logit_on_p14) * 100.0
-        off_df["y_cf_on_divT_prob"] = pam_on_divT * sigmoid(logit_on_divT) * 100.0
-        off_df["y_cf_on_divC_prob"] = pam_on_divC * sigmoid(logit_on_divC) * 100.0
-        off_df["y_cf_on_repT_prob"] = pam_on_repT * sigmoid(logit_on_repT) * 100.0
-        off_df["y_cf_on_repC_prob"] = pam_on_repC * sigmoid(logit_on_repC) * 100.0
+        off_df["y_cf_on_tru_prob"] = model_pred_pct(logit_on_t, pam_on_t)
+        off_df["y_cf_on_p14_prob"] = model_pred_pct(logit_on_p14, pam_on_p14)
+        off_df["y_cf_on_divT_prob"] = model_pred_pct(logit_on_divT, pam_on_divT)
+        off_df["y_cf_on_divC_prob"] = model_pred_pct(logit_on_divC, pam_on_divC)
+        off_df["y_cf_on_repT_prob"] = model_pred_pct(logit_on_repT, pam_on_repT)
+        off_df["y_cf_on_repC_prob"] = model_pred_pct(logit_on_repC, pam_on_repC)
         baseline_on = off_df["y_pred_on_prob"]
     else:
-        off_df["U_on"] = abduct_U(np.asarray(off_df["y_obs_on_prob"].values), logit_on_f, pam_on_f)
+        # Abduzione classica (mode-aware) sull'on-target
+        off_df["U_on"] = abduct_U(
+            np.asarray(off_df["y_obs_on_prob"].values),
+            logit_on_f,
+            pam_on_f,
+            pam_mode=args.pam_mode,
+        )
         U_on_arr = np.asarray(off_df["U_on"].values)
-        off_df["y_cf_on_tru_prob"] = counterfactual_prob_pct(logit_on_t, pam_on_t, U_on_arr)
-        off_df["y_cf_on_p14_prob"] = counterfactual_prob_pct(logit_on_p14, pam_on_p14, U_on_arr)
-        off_df["y_cf_on_divT_prob"] = counterfactual_prob_pct(logit_on_divT, pam_on_divT, U_on_arr)
-        off_df["y_cf_on_divC_prob"] = counterfactual_prob_pct(logit_on_divC, pam_on_divC, U_on_arr)
-        off_df["y_cf_on_repT_prob"] = counterfactual_prob_pct(logit_on_repT, pam_on_repT, U_on_arr)
-        off_df["y_cf_on_repC_prob"] = counterfactual_prob_pct(logit_on_repC, pam_on_repC, U_on_arr)
+        cf_on = lambda l, p: counterfactual_prob_pct(l, p, U_on_arr, pam_mode=args.pam_mode)
+        off_df["y_cf_on_tru_prob"] = cf_on(logit_on_t, pam_on_t)
+        off_df["y_cf_on_p14_prob"] = cf_on(logit_on_p14, pam_on_p14)
+        off_df["y_cf_on_divT_prob"] = cf_on(logit_on_divT, pam_on_divT)
+        off_df["y_cf_on_divC_prob"] = cf_on(logit_on_divC, pam_on_divC)
+        off_df["y_cf_on_repT_prob"] = cf_on(logit_on_repT, pam_on_repT)
+        off_df["y_cf_on_repC_prob"] = cf_on(logit_on_repC, pam_on_repC)
         baseline_on = off_df["y_obs_on_prob"]
 
     off_df["delta_on_tru"] = off_df["y_cf_on_tru_prob"] - baseline_on
@@ -422,7 +484,7 @@ def main():
     ax.axvline(0, color="gray", linewidth=0.8)
     ax.set_xlabel("Delta On-Target Probability (cf - baseline) [%]")
     ax.set_ylabel("Delta Off-Target Probability (cf - baseline) [%]")
-    ax.set_title(f"Pareto Trade-Off Causale ({args.dataset})\n"
+    ax.set_title(f"Pareto Trade-Off Causale ({args.dataset}, pam_mode={args.pam_mode})\n"
                  f"Quadrante in basso-a-destra = ideale (off↓, on↑)")
     ax.legend(loc="upper left", fontsize=9)
     plt.tight_layout()
@@ -456,6 +518,7 @@ def main():
 
     # 15. Sommario su stdout — aggregato globale (per coppia)
     print("\n=== SOMMARIO GLOBALE (per coppia) ===")
+    print(f"PAM mode:          {args.pam_mode}")
     print(f"Coppie analizzate: {len(off_df)}")
     print(f"Guide uniche:      {off_df['name'].nunique()}")
     print(f"\npam_off  mean={off_df['pam_off_f'].mean():.3f}  std={off_df['pam_off_f'].std():.3f}")
@@ -467,6 +530,20 @@ def main():
               f"median={off_df['U_on'].median():+.3f}")
     else:
         print("U_on   N/A (on-target mode = drop, nessuna abduzione)")
+
+    # Diagnostica saturazione (per modalità multiplicative; in additive non dovrebbe accadere)
+    if args.pam_mode == "multiplicative":
+        sat_off = (off_df["y_obs_off_prob"] / 100.0 >= off_df["pam_off_f"]).sum()
+        if has_u_on:
+            sat_on = (off_df["y_obs_on_prob"] / 100.0 >= off_df["pam_on_f"]).sum()
+        else:
+            sat_on = 0
+        print(f"\n[diagnostica multiplicative] coppie con y_obs ≥ pam_gate (clipping attivo):")
+        print(f"  off-target: {sat_off}/{len(off_df)} ({100*sat_off/len(off_df):.1f}%)")
+        if has_u_on:
+            print(f"  on-target:  {sat_on}/{len(off_df)} ({100*sat_on/len(off_df):.1f}%)")
+    else:
+        print(f"\n[diagnostica additive] nessuna saturazione possibile per costruzione (no clipping artifact).")
 
     interventions_summary = [
         ("Truncation 5' (sequence)", "delta_off_tru", "delta_on_tru"),
