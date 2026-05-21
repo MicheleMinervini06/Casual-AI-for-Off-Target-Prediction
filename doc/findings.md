@@ -512,4 +512,235 @@ Questa forma è identica a ciò che `simulate_intervention.py` e `simulate_inter
 | Abduction individuale `U*` | `U* = logit(y_obs) − struct_logit(x)` | algebraica, post-hoc, zero overhead di training |
 | Controfattuale individuale | `σ(struct_logit(x_cf) + U*)` | già operativo in `simulate_intervention_batch.py` |
 
-**Nota sulla pam_gate:** l'abduction algebrica ignora il fattore moltiplicativo `pam_gate` (`activity_prob = pam_gate × σ(logit)`). La forma esatta non è risolvibile in forma chiusa con pam_gate. Per off-target con PAM canonico (NGG, `pam_gate ≈ 1`) l'approssimazione è trascurabile; per PAM non canonici introduce un bias sistematico. Documentato come limitazione.
+**Nota sulla pam_gate:** l'abduction algebrica ignora il fattore moltiplicativo `pam_gate` (`activity_prob = pam_gate × σ(logit)`). La forma esatta non è risolvibile in forma chiusa con pam_gate. Per off-target con PAM canonico (NGG, `pam_gate ≈ 1`) l'approssimazione è trascurabile; per PAM non canonici introduce un bias sistematico. Documentato come limitazione (vedi F17 per l'evidenza empirica del problema reale).
+
+---
+
+## Fase 6 — Limiti architetturali di positional_mlp: evidenza empirica
+
+Dopo aver corretto l'abduction in formula `pam_gate`-aware (F15) e aver aggiunto due nuovi interventi mirati a sondare i limiti rappresentazionali del modello, sono emerse evidenze empiriche dirette di limiti che fino a Run 15 erano solo ipotizzati.
+
+### F16 — Conferma empirica della blindness inter-posizionale
+
+**Esperimento:** estensione di `simulate_intervention_batch.py` con due nuovi interventi a livello sequenza, eseguiti sull'intero dataset GUIDEseq positivo (1616 coppie, 46 guide):
+
+1. **Diversity intervention** — Treatment vs Control sulle 4 posizioni PAM-prossimali (indici 16-19):
+   - Treatment T: `guide[16:20] = "ACGT"` (massima diversità A/C/G/T)
+   - Control C: `guide[16:20] = "AAAA"` (nessuna diversità)
+2. **Repeat intervention** — Treatment vs Control sul seed (indici 8-15):
+   - Treatment T: `guide[8:16] = "ATATATAT"` (perfect period-2 repeat)
+   - Control C: `guide[8:16] = "AAAATTTT"` (stessa composizione A/T, no period-2)
+
+Per ciascuno, calcolato il contrasto `delta_TC = y_cf_T − y_cf_C` come metrica dell'effetto "puro" dell'intervento isolato dal contesto della coppia.
+
+**Risultati (per coppia):**
+
+| Intervento | `delta_T` off | `delta_C` off | **contrast T-C** off |
+|---|---:|---:|---:|
+| Diversity ACGT vs AAAA | −22.85% | −24.54% | **+1.69%** |
+| Repeat ATATATAT vs AAAATTTT | −34.08% | −34.34% | **+0.26%** |
+
+**Interpretazione:**
+
+- Entrambi i treatment-control producono effetti individuali enormi (~−22 a −36%) perché *qualsiasi* modifica del seed o PAM-proximal introduce mismatch nuovi
+- Ma il **contrasto T-C è vicino a zero**: il modello dà predizioni quasi identiche a (1) ACGT e AAAA, (2) ATATATAT e AAAATTTT
+- Per (1): conferma che il modello non rappresenta "diversità A/C/G/T" come concetto — vede 4 penalità posizionali indipendenti che si sommano in modo simile
+- Per (2): conferma che il modello è strutturalmente cieco alle ripetizioni — due sequenze con stessa composizione globale ma struttura diversa danno output indistinguibili
+
+Il "quadrante ideale 41.3%" delle guide per il repeat è un **falso segnale**: i `delta_TC` sono ≈ 0 (modello insensibile), quindi rientrano nei criteri (Δoff < 0 ⪅ 0, Δon ≥ −5% ⪅ 0) per pura assenza di risposta, non per efficacia.
+
+**Implicazione metodologica:** queste due interventi servono da "stress test" diagnostico. Confermano operativamente che positional_mlp ha receptive field = 1 e non può rilevare proprietà joint o cross-position. Non è un fallimento del modello, è la conferma empirica del trade-off architetturale scelto in Run 15.
+
+---
+
+### F17 — Saturazione di pam_gate vs y_obs on-target
+
+**Scoperta:** una volta corretta l'abduction in formula pam_gate-aware (F15, F-Fase 5), per la maggioranza delle guide GUIDEseq la variabile `U_on` risulta saturata al *clipping ceiling* di `logit(1 − ε) ≈ 16`:
+
+```
+U_on median (per-guida) = 14.18    U_on max = 15.43
+```
+
+**Causa diretta:** il modello ha appreso `pam_gate ≈ 0.73` (mean across pairs, std ≈ 0) per i PAM canonici NGG, mentre l'attività osservata on-target raggiunge il 99% (cap superiore di `reads_to_prob`). La formula di abduction:
+
+```
+U = logit(y_obs / pam_gate) − struct_logit
+```
+
+richiede `y_obs / pam_gate < 1`. Ma `99% / 73% = 1.35 > 1`, quindi il clipping interviene e U si satura. Il modello dice "il massimo di attività fisicamente possibile è 73%", i dati dicono 99% — inconsistenza strutturale.
+
+**Conseguenza sui controfattuali on-target:** l'intervento `do(pos_14 = 0)` dovrebbe essere un *no-op* sull'on-target (la guida è uguale a se stessa, `P_14_factual ≈ 0` per match). Verifica nei dati: dove `U_on` non è saturato (es. AAVS1_site_13, U_on=1.40), `delta_on_p14 = 0` esattamente. Dove `U_on` è saturato (es. AAVS1_site_1, U_on=14.36), `delta_on_p14 = −26%` — un artefatto del clipping. La media per coppia (`delta_on_p14 = −7.99%`) è dominata dalle guide saturate; la mediana per-guida è 0.
+
+**Perché non l'avevamo visto prima:** col vecchio codice che ignorava `pam_gate` nell'abduction (F15-bis: vecchia formula `U = logit(y_obs) − logit`), U assorbiva il gap modello-dati senza generare clipping. La saturazione era nascosta nell'approssimazione.
+
+**Implicazione:** è un bug di calibrazione del modello, non dell'abduction. Va corretto trainando un modello con `pam_gate` calibrato sulla realtà dei dati on-target (vedi piano fase 7).
+
+---
+
+### F18 — I 4 limiti precisi di positional_mlp e cosa è già stato tentato per superarli
+
+Sintesi delle limitazioni emerse dai findings precedenti:
+
+| # | Limite | Origine | Già tentato di superarlo? | Esito |
+|---|---|---|---|---|
+| **L1** | Receptive field = 1 posizione (no joint/cross-position patterns) | `pos_node` applicata posizione-per-posizione con weight sharing | Sì — architetture regionali Exp04-11 | **Tutte hanno perso** contro positional_mlp |
+| **L2** | Encoding 4-dim (perde l'identità delle basi: distingue solo match/wobble/transition/transversion) | Il branch positional_mlp ricalcola internamente un 4-dim invece di usare i 12-dim della `BiologicalMismatchEncoder` | No — l'encoder esiste ma il branch lo bypassa | Opportunità aperta |
+| **L3** | Hard prior posizionale assume indipendenza | `w_pos[i]` indipendenti, nessun termine di interazione | No | Opportunità aperta |
+| **L4** | PAM gate saturato (max 0.73 vs 99% osservato) | `pam_node` ha appreso valore conservativo durante training, vincolato dal training imbalanced | No — bug appena scoperto in F17 | Opportunità aperta, priorità immediata |
+
+**Tabella architetture tentate per L1 (AUPRC test / GUIDEseq):**
+
+| Run | Architettura | Cross-position | AUPRC test | AUPRC GUIDEseq |
+|---|---|---|---:|---:|
+| Exp04 | linear_bypass | No (somma mismatch) | 0.088 | 0.125 |
+| Exp05 | mini_mlp | Regionale (binary mismatch) | 0.100 | 0.072 |
+| Exp06 | typed_mlp | Regionale (typed mismatch) | 0.096 | 0.156 |
+| Exp08 | learned_mlp | Regionale + embedding learnable | **0.008** | **0.007** |
+| Exp09 | context_aware_mlp | Regionale + context-aware | **0.008** | 0.013 |
+| Exp11 | typed_mlp + hybrid | Regionale | 0.090 | 0.166 |
+| Exp12 | positional_mlp (v1) | No | 0.161 | 0.226 |
+| Exp13 | positional_mlp + focal tune | No | 0.182 | 0.276 |
+| **Exp15** | **positional_mlp + extended** | **No** | **0.154** | **0.285** |
+
+**Lettura chiave:** tutte le architetture con capacità cross-position regionale (mini_mlp, typed_mlp, learned_mlp, context_aware_mlp) hanno *perso* contro il semplice positional_mlp. Quelle troppo capaci (learned, context_aware) sono crollate disastrosamente — overfitting puro sui ~3M esempi di training. La **parsimonia vince empiricamente**, non è solo una preferenza teorica.
+
+**Conclusione operativa:** L1 e L3 sono "limiti by design" della filosofia parsimoniosa scelta in Run 15 — tentativi di superarli con maggiore capacità sono già stati fatti e hanno fallito. L2 e L4 sono invece opportunità non sfruttate che potrebbero essere risolte senza compromettere la filosofia del modello (entrambi mantengono 1-to-1 P_i ↔ posizione i).
+
+---
+
+### Todo Fase 7 — Piano sperimentale
+
+- [x] **Run 18** — Fix calibrazione `pam_gate` (L4). Adottata l'alternativa (b): trasformazione `pam_gate` da fattore moltiplicativo a contributo additivo nel logit (vedi F19). Risultato: net win predittivo.
+- [x] **Run 19** — Encoding 12-dim per `pos_node` (L2). Risultato: overfitting (vedi F20).
+- [x] **Run 20** — Regolarizzazione causale soft (λ_causal=0.10) per arginare l'overfit di Run 19. Risultato: causal loss raw ridotta ma val AUPRC non migliorata (vedi F21).
+- [ ] **(opzionale)** — Conv1D kernel=3 sulle posizioni (tentativo controllato per L1). Dopo i risultati F20-F21, l'evidenza empirica suggerisce che ogni aumento di capacità per posizione viene assorbito come overfit, quindi non è una priorità.
+- [x] Aggiornato `simulate_intervention_batch.py` per supportare entrambe le modalità PAM (vedi F19, sezione "Aggiornamento abduction additiva").
+
+---
+
+### F19 — Run 18: PAM additivo risolve la saturazione di pam_gate
+
+**Setup:** stesso modello di Run 15 (positional_mlp con encoding 4-dim ricalcolato internamente) ma con `pam_mode=additive`. La PAM contribuisce additivamente al logit invece di moltiplicare l'attività:
+
+```
+Multiplicative (Run 15):  activity = pam_gate × σ(struct_logit + U)        ← cap implicito a pam_gate
+Additive (Run 18):        activity = σ(struct_logit + pam_logit + U)        ← nessun cap
+```
+
+Implementazione: nuovo parametro `pam_mode` in `NeuralSCM.__init__`, nuovo metodo `forward_logit()` in `PAMModule` che restituisce il logit raw, branching nel `_base_forward`. Il path multiplicativo è preservato per Run 15 backward-compat.
+
+**Risultati predittivi (Run 15 vs Run 18):**
+
+| Metrica | Run 15 (multiplicative) | Run 18 (additive) | Δ |
+|---|---:|---:|---:|
+| **CHANGE-seq test AUPRC** | **0.154** | **0.244** | **+59%** |
+| CHANGE-seq test AUROC | 0.905 | 0.950 | +5% |
+| **GUIDE-seq AUPRC** | **0.285** | **0.347** | **+22%** |
+| GUIDE-seq AUROC | 0.964 | 0.977 | +1.3% |
+| Loss finale (train) | 0.0029 | 0.0017 | −41% |
+| L2 pesi finali | 14.5 | 9.2 | −37% |
+| CCS_Overall | 0.333 | 0.167 | −50% |
+
+**Interpretazione:**
+
+Il `pam_gate` saturato a 0.73 (F17) era un **collo di bottiglia capacitivo**, non un regolarizzatore. Rimuovendo il cap implicito, il modello può raggiungere attività predette vicine a 1.0 per gli on-target, allineandosi con i dati. La saturazione di `U_on` nell'abduction pam_gate-aware sparisce (vedi sotto).
+
+**Pesi posizionali Run 18** (più informativi/leggibili):
+
+```
+posizioni:  0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19
+peso:    -0.45 -0.57 -0.88 -1.10 -1.27 -1.03 -1.41 -1.40 -1.18 -0.97 -1.19 -1.36 -1.60 -1.88 -1.37 -1.68 -1.44 -1.67 -1.87 -1.52
+```
+
+Pattern biologicamente coerente: pos 0-3 PAM-distali poco penalizzate; seed (8-15) e PAM-proximal (16-19) fortemente penalizzate; pos 13 e 18 i picchi (coerente con la letteratura su seed criticality).
+
+**Drop del CCS spiegato:** il CCS hardcoded usa `do(pam_gate=0.1)` per "PAM ablation". In modo additivo, `pam_logit_contrib=0.1` è un contributo logit quasi neutrale (non un'ablazione). R1 fallisce, R6 (gerarchia 1.0 > 0.2 > 0.1) regge. → 1/6 = 0.167. Non è una regressione del modello, è incompatibilità semantica del benchmark con la modalità additiva. Per renderlo significativo nel modo additivo servirebbe `do(pam_gate=-3.0)` (logit fortemente negativo).
+
+**Aggiornamento abduction additiva:** lo script `simulate_intervention_batch.py` è stato aggiornato per supportare entrambe le modalità. In modalità additiva l'abduction è più semplice:
+```
+multiplicativo:  U = logit(y_obs / pam_gate) - struct_logit    (con clipping per y_obs > pam_gate)
+additivo:        U = logit(y_obs) - final_logit                 (no division, no clipping artifact)
+```
+
+Con Run 18 la saturazione di U_on (F17) è **strutturalmente impossibile** — non c'è più un denominatore < 1 nella formula.
+
+---
+
+### F20 — Run 19: encoding 12-dim per pos_node causa overfitting
+
+**Setup:** estende Run 18 (additive PAM) sostituendo l'input 4-dim di `pos_node` (mismatch type ricalcolato) con i 12-dim della `BiologicalMismatchEncoder`:
+
+```
+4-dim  (Run 18):  [mismatch_oh(4)]
+12-dim (Run 19):  [mismatch_oh(4), sgRNA_base_oh(4), off_target_base_oh(4)]
+```
+
+Implementazione: nuovo parametro `positional_use_encoder: bool` in `NeuralSCM.__init__`, branching nel `_base_forward` del positional_mlp.
+
+**Razionale teorico:** il 12-dim dovrebbe consentire preferenze posizionali base-specifiche (es. "C in pos 13 diverso da T in pos 13"), abilitando interventi semanticamente più ricchi (diversity ACGT, repeat) che il 4-dim non può rappresentare.
+
+**Risultati predittivi (Run 18 vs Run 19):**
+
+| Metrica | Run 18 (4-dim) | Run 19 (12-dim) | Δ |
+|---|---:|---:|---:|
+| Train AUPRC | 0.855 | 0.903 | +5.6% ↑ |
+| Train AUROC | 0.984 | 0.990 | +0.6% ↑ |
+| **Val AUPRC peak** | **0.115** | **0.077** | **−33% ↓** |
+| **CHANGE-seq test AUPRC** | **0.244** | **0.171** | **−30% ↓** |
+| GUIDE-seq AUPRC | 0.347 | 0.326 | −6% ↓ |
+| Loss finale (train) | 0.0017 | 0.0013 | −24% |
+
+**Diagnosi — overfitting netto:** Train sale, Val/Test scendono. Il modello con 12-dim ha più capacità per posizione (parametri della prima Linear: 40 → 104, ×2.6) e impara correlazioni base-specifiche presenti nel training set di CHANGE-seq che **non trasferiscono** a Val/Test/cross-assay.
+
+**Pesi posizionali appiattiti:** Run 18 ha range −0.45 a −1.88 (varianza alta, signature seed forte). Run 19 ha range −0.22 a −1.03 (più piatti). Il segnale "questa posizione conta" è stato assorbito dentro la `pos_node` MLP arricchita, che lo apprende come pattern base-specifico training-specific. Effetto: il vincolo strutturale "peso per posizione" perde forza relativa.
+
+**Implicazione metodologica per la tesi:** il bottleneck 4-dim **non è una limitazione**, è un **regolarizzatore strutturale**. Forza il modello a concentrarsi sull'unica feature biologicamente robusta (il tipo di mismatch) ignorando la composizione di base specifica (confounded con bias guide-specific nei dati). Il 4-dim batte il 12-dim non per parsimonia "filosofica" ma per inductive bias efficace.
+
+---
+
+### F21 — Run 20: regolarizzazione causale soft non sostituisce il bottleneck strutturale
+
+**Setup:** estende Run 19 (additive PAM + 12-dim) alzando il peso della causal loss da `λ_causal=0.01` a `λ_causal=0.10` (×10). Razionale: rendere la directional margin loss un vincolo reale che possa controbilanciare l'overfit base-specifico.
+
+**Risultati training (Run 19 vs Run 20, valori a epoch 11):**
+
+| Componente | Run 19 (λ=0.01) | Run 20 (λ=0.10) | Δ |
+|---|---:|---:|---:|
+| `loss_pred` (Focal) | 0.0012 | 0.0014 | +17% |
+| **`loss_causal` raw** | **0.0177** | **0.0121** | **−32%** |
+| Contributo causal al totale (× λ) | 0.000177 | 0.00121 | ×6.8 |
+| Loss totale | 0.0013 | 0.0026 | +100% |
+| Train AUPRC | 0.904 | 0.884 | −2.2% |
+| **Val AUPRC peak** | **0.077** | **~0.070** | **−9%** |
+
+**Quello che funziona:** la regolarizzazione causale agisce sul suo target. `loss_causal_raw` scende del 32%, il modello fa **meno violazioni di direzionalità** durante il training. Train AUPRC scende leggermente, segno che il modello sta sacrificando un po' di fit per la causalità.
+
+**Quello che NON funziona:** Val AUPRC peak è **leggermente più bassa** di Run 19 (0.070 vs 0.077). Il vincolo causale ha agito sulla coerenza direzionale dell'output globale ma **non sull'overfit specifico per posizione/base**.
+
+**Diagnosi — dimensioni ortogonali:**
+
+La causal loss attuale (`F.relu(delta_pred × −expected_direction + margin)`) misura *direzionalità globale* dell'attività post-intervento. L'overfit del 12-dim invece accade su preferenze posizionali base-specifiche. Il modello può soddisfare entrambi simultaneamente:
+
+- Rispetta la monotonia: "più mismatch → meno attività" (causal loss soddisfatta)
+- Apprende preferenze training-specific: "in pos 13 T penalizza di più di C" (overfit non vincolato dalla causal loss)
+
+**Implicazione teorica:** la coerenza causale a livello di output non implica generalizzazione su dimensioni feature-specifiche. La **regolarizzazione strutturale (bottleneck 4-dim) agisce direttamente sulla capacità rappresentativa**, mentre la regolarizzazione causale soft agisce sul comportamento di output. Sono due tipi di vincolo che operano su livelli diversi del modello.
+
+**Conclusione operativa:** Run 18 (additive PAM + 4-dim) resta il **modello vincitore**. L'evidenza empirica accumulata (Run 18 → 19 → 20) è coerente e ridondante: il bottleneck 4-dim è il regolarizzatore migliore disponibile in questo regime.
+
+---
+
+### Sintesi finale Fase 7 — modello vincitore e configurazione consolidata
+
+| Componente | Scelta finale | Run di riferimento |
+|---|---|---|
+| Architettura | positional_mlp (20 nodi P_i indipendenti) | Run 15-20 |
+| Encoder per pos_node | 4-dim mismatch type ricalcolato internamente | Run 15, 18 |
+| PAM gating | additivo (contributo logit) | **Run 18** |
+| Encoding ricco (12-dim) | NON adottato (overfit) | Run 19 (negativo) |
+| Regolarizzazione causale forte | NON necessaria | Run 20 (negativo) |
+| λ_causal | 0.01 (decorativo nel positional_mlp) | Run 15-18 |
+| Abduction | algebraica post-hoc, formula additiva | F15 → F19 |
+| **Modello di riferimento per explainability** | **Exp18_Positional_AdditivePAM** | F19 |
+
+L'explainability finale (intervento truncation, do(pos_14), diversity, repeat) verrà eseguita sul modello Exp18 con `simulate_intervention_batch.py` aggiornato per la modalità additiva.

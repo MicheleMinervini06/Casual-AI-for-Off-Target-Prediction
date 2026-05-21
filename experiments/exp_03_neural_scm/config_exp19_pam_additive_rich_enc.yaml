@@ -1,0 +1,72 @@
+_base: experiments/configs/base.yaml
+
+experiment:
+  name: Exp19_Positional_AdditivePAM_RichEnc
+  tags: ["hybrid_causal", "positional_mlp", "run_19", "pam_additive", "rich_encoding", "biological_mismatch_full"]
+  notes: "Run 19: estende Run 18 (additive PAM) usando l'output completo della BiologicalMismatchEncoder come input a pos_node, invece del 4-dim mismatch type ricalcolato internamente. positional_use_encoder=true → pos_node riceve 12-dim per posizione (mismatch_type one-hot 4 + sgRNA_base one-hot 4 + off_target_base one-hot 4). Atteso: il modello acquisisce preferenze posizionali base-specifiche (es. 'T in posizione 13 diverso da C in posizione 13'), aumentando la magnitudo del contrasto T-C in interventi diversity. La struttura causale del DAG (P_0..P_19 come nodi posizionali indipendenti) resta invariata — niente cross-position."
+model:
+  architecture: "positional_mlp"
+  embed_dim: 16        # ignorato dalla BiologicalMismatchEncoder (ha embed_dim=12 fisso)
+  hidden_dim: 8
+  encoder: biological_mismatch
+
+  context_cols:
+    - gc_sgRNA
+    - gc_offtarget
+    - concept_gc_delta
+
+  # --- PAM mode ---
+  pam_mode: additive               # Come Run 18 — risolve la saturazione (vedi F17)
+
+  # --- Positional encoding richness (NEW in Run 19) ---
+  positional_use_encoder: true     # pos_node legge i 12-dim dell'encoder
+
+  # --- Variational SCM disabilitato per Run 19 ---
+  variational: false
+
+training:
+  device: cuda
+  learning_rate: 0.0001            # Identico a Run 15/18 per isolare l'effetto encoding
+  batch_size: 64
+  epochs: 30
+  patience: 99
+  pos_weight_dynamic: false
+  pos_weight: 5.0
+  loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 3.0
+  lambda_causal: 0.1
+  lambda_consist: 0.01
+  pct_start: 0.15
+
+  # IRM disabilitato
+  irm_enabled: false
+  lambda_irm_max: 1.0
+  irm_warmup_epochs: 5
+
+phase3:
+  fit_split: train
+  evaluation_split: test
+  max_fit_rows: null
+  max_eval_rows: null
+
+baseline:
+  ccs_json: experiments/results/exp_02_scm/ccs_baseline.json
+
+ccs:
+  enabled: true
+  mode: 6_rules
+  max_guides: 200
+  guide_source_split: test
+
+output:
+  model_pt: neural_scm.pt
+  metrics_changeseq_train_json: metrics_changeseq_train.json
+  metrics_changeseq_val_json: metrics_changeseq_val.json
+  metrics_changeseq_json: metrics_changeseq.json
+  metrics_guideseq_json: metrics_guideseq.json
+  ccs_neural_json: ccs_neural.json
+  ccs_comparison_json: ccs_comparison.json
+
+tracking:
+  enabled: true

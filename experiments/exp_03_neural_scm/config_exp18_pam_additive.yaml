@@ -1,0 +1,69 @@
+_base: experiments/configs/base.yaml
+
+experiment:
+  name: Exp18_Positional_AdditivePAM
+  tags: ["hybrid_causal", "positional_mlp", "run_18", "pam_additive", "pam_calibration_fix"]
+  notes: "Run 18: stesso setup di Run 15 (positional_mlp, no variational) ma con pam_mode=additive. Fix per la saturazione del pam_gate documentata in F17: rimuoviamo il fattore moltiplicativo (cap implicito a pam_gate ≈ 0.73) e iniettiamo il contributo PAM come logit additivo (final_logit = thermo + context + u_term + pam_logit). Atteso: activity_prob può raggiungere 1.0 per on-target, U_on non più saturato in abduction pam_gate-aware."
+model:
+  architecture: "positional_mlp"
+  embed_dim: 16
+  hidden_dim: 8
+  encoder: biological_mismatch  # Scegli tra "pairwise" o "biological_mismatch" o "context_aware"
+
+  context_cols:
+    - gc_sgRNA
+    - gc_offtarget
+    - concept_gc_delta
+
+  # --- PAM mode (NEW in Run 18) ---
+  pam_mode: additive             # "multiplicative" (Run 15) o "additive" (Run 18+)
+
+  # --- Variational SCM disabilitato per Run 18 ---
+  variational: false
+
+training:
+  device: cuda
+  learning_rate: 0.0001  # Identico a Run 15 per isolare l'effetto pam_mode
+  batch_size: 64
+  epochs: 30
+  patience: 99 # Disabilita early stopping per garantire un confronto completo
+  pos_weight_dynamic: false
+  pos_weight: 5.0
+  loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 3.0
+  lambda_causal: 0.01
+  lambda_consist: 0.01
+  pct_start: 0.15
+
+  # IRM disabilitato
+  irm_enabled: false
+  lambda_irm_max: 1.0
+  irm_warmup_epochs: 5
+
+phase3:
+  fit_split: train
+  evaluation_split: test
+  max_fit_rows: null
+  max_eval_rows: null
+
+baseline:
+  ccs_json: experiments/results/exp_02_scm/ccs_baseline.json
+
+ccs:
+  enabled: true
+  mode: 6_rules
+  max_guides: 200
+  guide_source_split: test
+
+output:
+  model_pt: neural_scm.pt
+  metrics_changeseq_train_json: metrics_changeseq_train.json
+  metrics_changeseq_val_json: metrics_changeseq_val.json
+  metrics_changeseq_json: metrics_changeseq.json
+  metrics_guideseq_json: metrics_guideseq.json
+  ccs_neural_json: ccs_neural.json
+  ccs_comparison_json: ccs_comparison.json
+
+tracking:
+  enabled: true

@@ -27,3 +27,9 @@ catboost_info/
 
 # Wandb
 wandb/
+
+#Claude
+.claude*
+
+#thesis files
+doc/thesis/*
