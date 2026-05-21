@@ -281,6 +281,17 @@ def main(config_path: Path) -> None:
             variational_hidden_dim, u_encoder_detach_backbone, variational_mc_samples,
         )
 
+    # PAM mode: "multiplicative" (Run 15 backward-compat) o "additive" (Run 18+, fix F17)
+    pam_mode = str(model_cfg.get("pam_mode", "multiplicative"))
+    log.info("PAM mode: %s", pam_mode)
+
+    # Positional encoding richness:
+    #   False (default, Run 15/18): pos_node riceve 4-dim mismatch_type ricalcolato internamente
+    #   True  (Run 19+):            pos_node riceve i embed_dim dell'encoder (es. 12 per
+    #                                BiologicalMismatchEncoder = mismatch + sg_base + ot_base)
+    positional_use_encoder = bool(model_cfg.get("positional_use_encoder", False))
+    log.info("positional_use_encoder: %s", positional_use_encoder)
+
     model = NeuralSCM(
         architecture=architecture,
         embed_dim=int(model_cfg.get("embed_dim", 16)),
@@ -290,6 +301,8 @@ def main(config_path: Path) -> None:
         variational=variational,
         variational_hidden_dim=variational_hidden_dim,
         u_encoder_detach_backbone=u_encoder_detach_backbone,
+        pam_mode=pam_mode,
+        positional_use_encoder=positional_use_encoder,
     ).to(device)
 
     # 3. Train and save best model

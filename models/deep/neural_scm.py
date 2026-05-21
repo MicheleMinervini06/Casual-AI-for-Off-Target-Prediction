@@ -26,12 +26,21 @@ class NeuralSCM(nn.Module):
         variational: bool = False,
         variational_hidden_dim: int = 32,
         u_encoder_detach_backbone: bool = True,
+        pam_mode: str = "multiplicative",
+        positional_use_encoder: bool = False,
     ):
         super().__init__()
         self.architecture = architecture
         self.context_dim = context_dim
         self.variational = variational
         self.u_encoder_detach_backbone = u_encoder_detach_backbone
+        if pam_mode not in ("multiplicative", "additive"):
+            raise ValueError(f"pam_mode deve essere 'multiplicative' o 'additive', ricevuto: {pam_mode}")
+        self.pam_mode = pam_mode
+        # Per positional_mlp: usa l'output ricco dell'encoder ([B, 20, encoder.embed_dim])
+        # invece di ricalcolare internamente un 4-dim (mismatch_type only).
+        # Default False = compat con Run 15/18.
+        self.positional_use_encoder = positional_use_encoder
 
         # 1. Inizializzazione Encoder
         if encoder is None:
@@ -83,10 +92,14 @@ class NeuralSCM(nn.Module):
             self.proximal_node = TypedMismatchModule(region_size=4, hidden_dim=hidden_dim, input_dim_per_pos=8)
         
         elif self.architecture == "positional_mlp":
-            # Un singolo modulo "filtro" che processa ogni nucleotide in modo indipendente
-            # L'input è 4 (Match, Wobble, Transition, Transversion)
+            # Un singolo modulo "filtro" che processa ogni nucleotide in modo indipendente.
+            # Input dim dipende da positional_use_encoder:
+            #   False  → 4 (Match, Wobble, Transition, Transversion) — Run 15/18
+            #   True   → self.embed_dim (output ricco encoder, es. 12 per
+            #            BiologicalMismatchEncoder) — Run 19+
+            pos_input_dim = self.embed_dim if self.positional_use_encoder else 4
             self.pos_node = nn.Sequential(
-                nn.Linear(4, hidden_dim),
+                nn.Linear(pos_input_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1)
             )
@@ -213,11 +226,29 @@ class NeuralSCM(nn.Module):
         B = len(sgrnas)
         device = x_spacer.device
 
-        if "pam_gate" in intervention:
-            pam_gate = torch.full((B, 1), intervention["pam_gate"], device=device, dtype=torch.float32)
-            _, repr_pam = self.pam_node(x_pam) 
+        # PAM gating — branching tra modalità moltiplicativa (Run 15 e precedenti)
+        # e additiva (Run 19+, fix per la saturazione del pam_gate, vedi F17).
+        if self.pam_mode == "additive":
+            # In modalità additiva il contributo PAM è un logit raw che viene SOMMATO
+            # al final_logit (vedi step 3 di _base_forward). Niente cap implicito.
+            if "pam_gate" in intervention:
+                # Valore di intervento interpretato come logit additivo diretto.
+                pam_logit_contrib = torch.full((B, 1), intervention["pam_gate"], device=device, dtype=torch.float32)
+                _, repr_pam = self.pam_node.forward_logit(x_pam)
+            else:
+                pam_logit_contrib, repr_pam = self.pam_node.forward_logit(x_pam)
+            # pam_gate per output dict viene calcolato alla fine come σ(pam_logit_contrib)
+            pam_gate = None  # placeholder; settato nello step finale
         else:
-            pam_gate, repr_pam = self.pam_node(x_pam)
+            # Multiplicative (Run 15 e precedenti): comportamento storico preservato
+            # (include il "doppio sigmoid": PAMModule applica sigmoid, poi _base_forward
+            # ne applica un altro — questo crea il cap effettivo a 0.73 documentato in F17).
+            if "pam_gate" in intervention:
+                pam_gate = torch.full((B, 1), intervention["pam_gate"], device=device, dtype=torch.float32)
+                _, repr_pam = self.pam_node(x_pam)
+            else:
+                pam_gate, repr_pam = self.pam_node(x_pam)
+            pam_logit_contrib = None  # non usato in multiplicative
 
         # Inizializziamo le rappresentazioni a zero (servono solo per deep_scm per non rompere il dict)
         repr_prox = torch.zeros(B, self.embed_dim, device=device)
@@ -357,21 +388,32 @@ class NeuralSCM(nn.Module):
             #   - intervention["seed"|"proximal"|"non_seed"] → IGNORATO
             # Per intervenire su un'intera regione, specificare tutti i pos_<i>
             # della regione (es. seed = pos_8..pos_15).
-            typed_batch = []
 
-            def get_mismatch_type(sg_char, ot_char):
-                if sg_char == ot_char: return [1.0, 0.0, 0.0, 0.0]
-                pair = {sg_char, ot_char}
-                if pair == {'G', 'T'}: return [0.0, 1.0, 0.0, 0.0]
-                if pair in [{'A', 'G'}, {'C', 'T'}]: return [0.0, 0.0, 1.0, 0.0]
-                return [0.0, 0.0, 0.0, 1.0]
+            # Input alla pos_node: dipende da self.positional_use_encoder.
+            #   - False (Run 15/18): ricalcola 4-dim mismatch type internamente
+            #     (Match, Wobble, Transition, Transversion)
+            #   - True  (Run 19+):  usa direttamente l'output ricco dell'encoder
+            #     x_spacer [B, 20, embed_dim]. Con BiologicalMismatchEncoder
+            #     embed_dim=12 (mismatch_type + sgRNA_base + off_target_base).
+            #     Permette preferenze posizionali base-specifiche.
+            if self.positional_use_encoder:
+                s_typed = x_spacer  # [B, 20, self.embed_dim]
+            else:
+                typed_batch = []
 
-            for sg, ot in zip(sgrnas, off_targets):
-                seq_encoding = [get_mismatch_type(sg[i], ot[i]) for i in range(20)]
-                typed_batch.append(seq_encoding)
+                def get_mismatch_type(sg_char, ot_char):
+                    if sg_char == ot_char: return [1.0, 0.0, 0.0, 0.0]
+                    pair = {sg_char, ot_char}
+                    if pair == {'G', 'T'}: return [0.0, 1.0, 0.0, 0.0]
+                    if pair in [{'A', 'G'}, {'C', 'T'}]: return [0.0, 0.0, 1.0, 0.0]
+                    return [0.0, 0.0, 0.0, 1.0]
 
-            # Tensore [Batch, 20, 4]
-            s_typed = torch.tensor(typed_batch, dtype=torch.float32, device=device)
+                for sg, ot in zip(sgrnas, off_targets):
+                    seq_encoding = [get_mismatch_type(sg[i], ot[i]) for i in range(20)]
+                    typed_batch.append(seq_encoding)
+
+                # Tensore [Batch, 20, 4]
+                s_typed = torch.tensor(typed_batch, dtype=torch.float32, device=device)
 
             # Passiamo tutte le posizioni attraverso la MLP condivisa
             # Output: [Batch, 20, 1] -> squeeze -> [Batch, 20]
@@ -405,8 +447,11 @@ class NeuralSCM(nn.Module):
         # =====================================================================
         # --- 3. PARTE COMUNE: NORMALIZZAZIONE E HARD PRIOR ---
         # =====================================================================
-        pam_gate = torch.sigmoid(pam_gate)
-        
+        if self.pam_mode == "multiplicative":
+            # Doppio sigmoid preservato per compatibilità con Run 15 (vedi F17).
+            pam_gate = torch.sigmoid(pam_gate)
+        # In additive mode, pam_gate viene calcolato dopo, da pam_logit_contrib.
+
         # Le ReLU normalizzano output anomali
         s_prox = F.relu(s_prox)
         s_seed = F.relu(s_seed)
@@ -448,7 +493,17 @@ class NeuralSCM(nn.Module):
             u_term = U.reshape(-1, 1).to(final_logit.device)
             final_logit = final_logit + u_term
 
-        activity_prob = pam_gate * torch.sigmoid(final_logit)
+        # --- Combiner PAM, branching per pam_mode ---
+        if self.pam_mode == "additive":
+            # PAM contribuisce additivamente al logit. Nessun cap implicito su activity.
+            # final_logit = thermo + context + u_term + pam_logit_contrib
+            final_logit = final_logit + pam_logit_contrib
+            activity_prob = torch.sigmoid(final_logit)
+            # Calcolo pam_gate per output dict (visualizzazione/diagnostica)
+            pam_gate = torch.sigmoid(pam_logit_contrib)
+        else:
+            # Multiplicative (Run 15 e precedenti): cap implicito a pam_gate
+            activity_prob = pam_gate * torch.sigmoid(final_logit)
 
         return {
             "pam_gate": pam_gate,

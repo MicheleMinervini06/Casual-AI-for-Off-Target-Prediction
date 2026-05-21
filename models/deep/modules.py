@@ -8,7 +8,10 @@ class PAMModule(nn.Module):
     """
     Processa l'embedding del trinucleotide PAM (posizioni 20-22).
     Input: Tensor(B, 3, E)
-    Output: Tuple[pam_gate Tensor(B, 1), representation Tensor(B, hidden_dim)]
+
+    Espone due interfacce:
+      - forward(x_pam):       restituisce (pam_gate ∈ (0,1), representation) — usato dal modo MOLTIPLICATIVO
+      - forward_logit(x_pam): restituisce (pam_logit_raw, representation)    — usato dal modo ADDITIVO
     """
     def __init__(self, embed_dim: int = 16, hidden_dim: int = 32):
         super().__init__()
@@ -21,13 +24,24 @@ class PAMModule(nn.Module):
         self.head = nn.Linear(hidden_dim, 1)
 
     def forward(self, x_pam: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Multiplicative-mode forward: returns pam_gate post-sigmoid."""
         B = x_pam.size(0)
         x_flat = x_pam.view(B, -1)
-        
-        representation = self.mlp(x_flat) 
+
+        representation = self.mlp(x_flat)
         pam_gate = torch.sigmoid(self.head(representation))
-        
+
         return pam_gate, representation
+
+    def forward_logit(self, x_pam: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Additive-mode forward: returns raw pre-sigmoid logit (can be any real value)."""
+        B = x_pam.size(0)
+        x_flat = x_pam.view(B, -1)
+
+        representation = self.mlp(x_flat)
+        pam_logit = self.head(representation)
+
+        return pam_logit, representation
 
 
 class SpacerRegionModule(nn.Module):
