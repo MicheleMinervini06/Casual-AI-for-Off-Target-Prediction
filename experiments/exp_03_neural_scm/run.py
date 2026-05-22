@@ -151,6 +151,47 @@ def _load_splits(cfg: dict) -> dict[str, pd.DataFrame]:
     return splits
 
 
+def _build_on_reads_lookup(raw_csv_path: Path, reads_col: str) -> dict[str, float]:
+    """
+    Costruisce un dict {guide_name: on_target_reads_max} dal CSV raw.
+    Necessario per il filtro `filter_saturated_changeseq` (Exp21+):
+    una coppia è "saturata" sse `off_reads >= on_reads` (vedi F22.1 in findings.md).
+    """
+    raw = pd.read_csv(raw_csv_path)
+    on_rows = raw[raw["distance"] == 0]
+    raw_lookup = on_rows.groupby("name")[reads_col].max().to_dict()
+    # Cast esplicito per stabilità del tipo restituito
+    return {str(k): float(v) for k, v in raw_lookup.items()}
+
+
+def _filter_saturated_pairs(
+    df: pd.DataFrame,
+    on_reads_lookup: dict[str, float],
+) -> tuple[pd.DataFrame, int]:
+    """
+    Rimuove le coppie positive saturate (off_reads >= on_reads della stessa guide).
+
+    Logica:
+      - Negativi (label=0) sono sempre mantenuti (i loro `reads` non sono
+        confrontabili contro on_reads).
+      - Positivi (label=1) con `reads >= on_reads` (lookup per guide_name) sono scartati.
+      - Positivi senza on_reads nel lookup (guide non presente nel raw) sono mantenuti
+        per safety (no false negatives nel filtro).
+
+    Returns: (filtered_df, n_dropped)
+    """
+    df = df.copy()
+    df["_on_reads"] = df["guide_name"].map(on_reads_lookup)
+
+    is_positive = df["label"] == 1
+    has_lookup = df["_on_reads"].notna()
+    is_saturated = is_positive & has_lookup & (df["reads"] >= df["_on_reads"])
+
+    keep_mask = ~is_saturated
+    n_dropped = int(is_saturated.sum())
+    return df[keep_mask].drop(columns=["_on_reads"]).reset_index(drop=True), n_dropped
+
+
 def _sample_df(df: pd.DataFrame, max_rows: int | None, seed: int) -> pd.DataFrame:
     if max_rows is None or max_rows <= 0 or len(df) <= max_rows:
         return df
@@ -199,9 +240,34 @@ def main(config_path: Path) -> None:
     phase3_cfg = cfg.get("phase3", {})
     fit_split = str(phase3_cfg.get("fit_split", "train"))
     eval_split = str(phase3_cfg.get("evaluation_split", "test"))
-    
+
     if fit_split not in splits or eval_split not in splits:
         raise ValueError(f"Invalid split selection fit={fit_split}, eval={eval_split}")
+
+    # 1b. Optional: filtro coppie saturate dal training set (Exp21+, vedi F23 in findings.md)
+    # Una coppia positiva è "saturata" sse `off_reads >= on_reads` per la stessa guide.
+    # Il filtro è applicato SOLO al training split, val e test restano invariati per
+    # garantire confrontabilità diretta con run precedenti (es. Exp18).
+    data_cfg = cfg.get("data", {})
+    if bool(data_cfg.get("filter_saturated_changeseq", False)):
+        raw_csv_rel = data_cfg.get("raw_changeseq_csv", "data/raw/changeseq/CHANGEseq_positive.csv")
+        reads_col = str(data_cfg.get("changeseq_reads_col", "CHANGEseq_reads"))
+        raw_csv_path = ROOT / raw_csv_rel
+        log.info("filter_saturated_changeseq=True. Building on_reads lookup from %s", raw_csv_path)
+        on_lookup = _build_on_reads_lookup(raw_csv_path, reads_col)
+        log.info("On-reads lookup built: %d guides", len(on_lookup))
+
+        before_train = len(splits[fit_split])
+        before_pos = int(splits[fit_split]["label"].sum())
+        splits[fit_split], n_dropped = _filter_saturated_pairs(splits[fit_split], on_lookup)
+        after_pos = int(splits[fit_split]["label"].sum())
+        log.info(
+            "Filtered saturated pairs from %s split: %d positives removed "
+            "(positives %d -> %d, total rows %d -> %d)",
+            fit_split, n_dropped, before_pos, after_pos, before_train, len(splits[fit_split]),
+        )
+    else:
+        log.info("filter_saturated_changeseq=False (default). No filtering applied.")
 
     df_train = _sample_df(splits[fit_split], phase3_cfg.get("max_fit_rows"), seed)
     df_val = splits["val"]
