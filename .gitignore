@@ -33,3 +33,7 @@ wandb/
 
 #thesis files
 doc/thesis/*
+
+#Explainability results
+explainability/batch_results*
+explainability/calibration_results*
