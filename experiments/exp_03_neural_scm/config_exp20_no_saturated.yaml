@@ -1,0 +1,76 @@
+_base: experiments/configs/base.yaml
+
+experiment:
+  name: Exp20_Positional_AdditivePAM_NoSaturated
+  tags: ["hybrid_causal", "positional_mlp", "run_20", "pam_additive", "data_hygiene", "no_saturated"]
+  notes: "Run 20: stesso setup di Run 18 (positional_mlp, additive PAM, encoding 4-dim) ma con filtro `filter_saturated_changeseq=true`. Rimuove le coppie positive con `off_reads >= on_reads` dal training set CHANGE-seq (~22k positives su 62k, dominati al 90% da LAG3_site_6, vedi F22.1). Validation e test set restano invariati per confrontabilità diretta con Exp18. Predizioni testabili (F23): GUIDE-seq AUPRC >= 0.347 (no degrado), U_off su CHANGE-seq post-training unimodale (no più Mode 2), b(vitro) post-train ridotto."
+
+# --- Filtro saturated abilitato (override di base.yaml) ---
+data:
+  filter_saturated_changeseq: true   # NEW vs Exp18
+
+model:
+  architecture: "positional_mlp"
+  embed_dim: 16
+  hidden_dim: 8
+  encoder: biological_mismatch
+
+  context_cols:
+    - gc_sgRNA
+    - gc_offtarget
+    - concept_gc_delta
+
+  # PAM mode additivo (identico a Exp18)
+  pam_mode: additive
+
+  # Encoding minimo (identico a Exp18; non usa il 12-dim)
+  positional_use_encoder: false
+
+  # Variational disabilitato
+  variational: false
+
+training:
+  device: cuda
+  learning_rate: 0.0001    # Identico a Exp18
+  batch_size: 64
+  epochs: 30
+  patience: 99
+  pos_weight_dynamic: false
+  pos_weight: 5.0
+  loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 3.0
+  lambda_causal: 0.01      # Identico a Exp18 (decorativo per positional_mlp)
+  lambda_consist: 0.01
+  pct_start: 0.15
+
+  irm_enabled: false
+  lambda_irm_max: 1.0
+  irm_warmup_epochs: 5
+
+phase3:
+  fit_split: train
+  evaluation_split: test
+  max_fit_rows: null
+  max_eval_rows: null
+
+baseline:
+  ccs_json: experiments/results/exp_02_scm/ccs_baseline.json
+
+ccs:
+  enabled: true
+  mode: 6_rules
+  max_guides: 200
+  guide_source_split: test
+
+output:
+  model_pt: neural_scm.pt
+  metrics_changeseq_train_json: metrics_changeseq_train.json
+  metrics_changeseq_val_json: metrics_changeseq_val.json
+  metrics_changeseq_json: metrics_changeseq.json
+  metrics_guideseq_json: metrics_guideseq.json
+  ccs_neural_json: ccs_neural.json
+  ccs_comparison_json: ccs_comparison.json
+
+tracking:
+  enabled: true

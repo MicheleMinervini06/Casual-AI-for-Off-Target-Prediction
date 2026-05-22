@@ -7,6 +7,15 @@ data:
   vectors_changeseq:  data/logs/changeseq_vectors.h5
   vectors_guideseq:   data/logs/guideseq_vectors.h5
 
+  # --- Filtro saturated pairs (Exp21+, vedi F22.1 / F23 in findings.md) ---
+  # Una coppia positiva è "saturata" se `off_reads >= on_reads` per la stessa guide.
+  # Tali coppie subiscono il cap di `reads_to_prob` (y_obs = 99%) e contribuiscono
+  # al cluster Mode 2 di U_off su CHANGE-seq (90% dominato da LAG3_site_6).
+  # Default `false` per backward compat con Exp15-Exp20.
+  filter_saturated_changeseq: false
+  raw_changeseq_csv:           data/raw/changeseq/CHANGEseq_positive.csv
+  changeseq_reads_col:         CHANGEseq_reads
+
 split:
   n_folds:     5
   test_fold:   4
