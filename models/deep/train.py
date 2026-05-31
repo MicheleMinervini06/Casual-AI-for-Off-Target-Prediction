@@ -320,32 +320,81 @@ def train(
     beta_kl_max = float(train_cfg.get("beta_kl_max", 1.0))
     kl_warmup_epochs = int(train_cfg.get("kl_warmup_epochs", 5))
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    weight_decay = float(train_cfg.get("weight_decay", 1e-4))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # Selettore scheduler.
+    #   - "onecycle"        : OneCycleLR (per-batch). Default per backward compat.
+    #   - "plateau"         : ReduceLROnPlateau su val AUPRC (per-epoch).
+    #   - "cosine_restarts" : CosineAnnealingWarmRestarts (per-batch).
+    #   - "constant"        : LambdaLR con warmup lineare + costante a lr.
+    scheduler_type = str(train_cfg.get("lr_scheduler_type", "onecycle")).lower()
+    scheduler_is_per_epoch = False  # True per "plateau" / "constant"
 
     try:
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=lr,
-            steps_per_epoch=len(train_loader),
-            epochs=epochs,
-            pct_start=train_cfg.get("pct_start", 0.3),
-            cycle_momentum=False,
-        )
-        logger.info("OneCycleLR scheduler attivato: max_lr=%.6f pct_start=%.2f", lr, train_cfg.get("pct_start", 0.3))
+        if scheduler_type == "onecycle":
+            scheduler = OneCycleLR(
+                optimizer,
+                max_lr=lr,
+                steps_per_epoch=len(train_loader),
+                epochs=epochs,
+                pct_start=train_cfg.get("pct_start", 0.3),
+                cycle_momentum=False,
+            )
+            logger.info("OneCycleLR scheduler: max_lr=%.6f pct_start=%.2f", lr, train_cfg.get("pct_start", 0.3))
 
-        # # --- NUOVO SCHEDULER: ReduceLROnPlateau ---
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer, 
-        #     mode='max',           # Monitoriamo una metrica da massimizzare (AUPRC)
-        #     factor=0.5,           # Dimezza il LR quando entra in plateau
-        #     patience=3,           # Aspetta 3 epoche senza miglioramenti prima di tagliare
-        #     min_lr=1e-6          # Non scendere sotto questo limite
-        #)
-        #logger.info("ReduceLROnPlateau scheduler attivato (monitoraggio Val AUPRC)")
+        elif scheduler_type == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=float(train_cfg.get("plateau_factor", 0.5)),
+                patience=int(train_cfg.get("plateau_patience", 3)),
+                min_lr=float(train_cfg.get("plateau_min_lr", 1e-6)),
+            )
+            scheduler_is_per_epoch = True
+            logger.info(
+                "ReduceLROnPlateau scheduler su val AUPRC: factor=%.2f patience=%d min_lr=%.1e",
+                float(train_cfg.get("plateau_factor", 0.5)),
+                int(train_cfg.get("plateau_patience", 3)),
+                float(train_cfg.get("plateau_min_lr", 1e-6)),
+            )
+
+        elif scheduler_type == "cosine_restarts":
+            T_0 = int(train_cfg.get("cosine_T_0", 10))
+            T_mult = int(train_cfg.get("cosine_T_mult", 2))
+            eta_min = float(train_cfg.get("cosine_eta_min", lr * 0.01))
+            steps_per_epoch = max(1, len(train_loader))
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=T_0 * steps_per_epoch,
+                T_mult=T_mult,
+                eta_min=eta_min,
+            )
+            logger.info(
+                "CosineAnnealingWarmRestarts scheduler: T_0=%d epoch (=%d step) T_mult=%d eta_min=%.1e",
+                T_0, T_0 * steps_per_epoch, T_mult, eta_min,
+            )
+
+        elif scheduler_type == "constant":
+            warmup_epochs = int(train_cfg.get("warmup_epochs", 5))
+            warmup_steps = max(1, warmup_epochs * len(train_loader))
+
+            def _lr_lambda(step: int) -> float:
+                if step < warmup_steps:
+                    return float(step + 1) / float(warmup_steps)
+                return 1.0
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+            logger.info(
+                "Constant scheduler: warmup lineare per %d epoch (=%d step), poi costante a %.1e",
+                warmup_epochs, warmup_steps, lr,
+            )
+        else:
+            raise ValueError(f"lr_scheduler_type non riconosciuto: {scheduler_type}")
 
     except Exception as e:
         scheduler = None
-        logger.warning("Impossibile istanziare Scheduler: %s. Continuo senza scheduler.", e)
+        logger.warning("Impossibile istanziare Scheduler '%s': %s. Continuo senza scheduler.", scheduler_type, e)
 
     best_auprc = -1.0
     best_model_state = None
@@ -380,28 +429,31 @@ def train(
                 current_beta_kl = beta_kl_max * (epoch + 1) / float(kl_warmup_epochs)
 
         # --- 2. TRAIN EPOCH ---
+        # Passiamo lo scheduler a train_epoch solo se è per-batch.
+        # Per scheduler per-epoca (plateau) lo steppiamo qui sotto dopo l'eval.
+        scheduler_for_train = None if scheduler_is_per_epoch else scheduler
         train_metrics = train_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             loss_fn=loss_fn,
             device=device,
-            scheduler=scheduler,
+            scheduler=scheduler_for_train,
             current_lambda_irm=current_lambda_irm, # Passiamo il lambda IRM
             pos_weight=pos_weight_val,
             current_beta_kl=current_beta_kl,
         )
-        
+
         val_metrics = evaluate(model, val_loader, device)
         current_auprc = val_metrics["auprc"]
-        
+
         # Calcolo della norma L2 totale della rete
         l2_norm = sum(p.norm(2).item() ** 2 for p in model.parameters()) ** 0.5
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # # Step dello scheduler ReduceLROnPlateau basato sulla AUPRC di validazione
-        # if scheduler is not None:
-        #     scheduler.step(current_auprc)
+        # Step per scheduler per-epoca (ReduceLROnPlateau): usa val AUPRC.
+        if scheduler_is_per_epoch and scheduler is not None:
+            scheduler.step(current_auprc)
 
         var_part = ""
         if is_variational:
